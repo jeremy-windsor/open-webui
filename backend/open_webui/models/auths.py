@@ -7,6 +7,7 @@ import uuid
 from typing import Optional
 
 from open_webui.internal.db import Base, JSONField, get_async_db_context
+from open_webui.models.totp import UserTOTPs
 from open_webui.models.users import User, UserModel, UserProfileImageResponse, Users
 from open_webui.utils.validate import validate_profile_image_url
 from pydantic import BaseModel, field_validator
@@ -204,6 +205,7 @@ class AuthsTable:
         async with get_async_db_context(db) as session:
             if not await Users.delete_user_by_id(id, db=session):
                 return False
+            await UserTOTPs.delete_totp_by_user_id(id, db=session)
             await session.execute(delete(Auth).where(Auth.id == id))
             await session.commit()
             return True
