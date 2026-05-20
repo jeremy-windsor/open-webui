@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Optional, Union
 
 import bcrypt
@@ -34,9 +34,11 @@ from open_webui.env import (
     WEBUI_SECRET_KEY,
     pk,
 )
+from open_webui.internal.db import get_async_db
 from open_webui.models.auths import Auths
 from open_webui.models.users import Users
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.bootstrap import bootstrap_user_creation_lock
 from pytz import UTC
 
 log = logging.getLogger(__name__)
@@ -213,36 +215,200 @@ def decode_token(token: str) -> dict | None:
         return None
 
 
-async def is_valid_token(request, decoded) -> bool:
+def get_token_issued_at(decoded: dict) -> int | None:
+    issued_at = decoded.get('iat')
+    if issued_at is None:
+        return None
+
+    if hasattr(issued_at, 'timestamp'):
+        return int(issued_at.timestamp())
+
+    try:
+        return int(issued_at)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_token_expires_at(decoded: dict) -> int | None:
+    expires_at = decoded.get('exp')
+    if expires_at is None:
+        return None
+
+    if hasattr(expires_at, 'timestamp'):
+        return int(expires_at.timestamp())
+
+    try:
+        return int(expires_at)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_token_totp_state_version(decoded: dict) -> int | None:
+    mfa = decoded.get('mfa') or {}
+    version = mfa.get('totp_version')
+    if version is None:
+        version = decoded.get('totp_state_version')
+
+    try:
+        return int(version)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_token_auth_state_version(decoded: dict) -> int | None:
+    try:
+        return int(decoded.get('auth_state_version') or 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_config_enabled(value) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    return str(value).lower() == 'true'
+
+
+def is_verified_user_role(user) -> bool:
+    return getattr(user, 'role', None) in {'user', 'admin'}
+
+
+def _get_header_case_insensitive(headers, name: str) -> str:
+    if not headers or not name:
+        return ''
+
+    if hasattr(headers, 'get'):
+        value = headers.get(name, '')
+        if value:
+            return str(value)
+
+    lower_name = name.lower()
+    try:
+        for key, value in headers.items():
+            if str(key).lower() == lower_name:
+                return str(value)
+    except Exception:
+        return ''
+
+    return ''
+
+
+def token_meets_trusted_header_requirements(decoded: dict, user, headers) -> bool:
+    if not WEBUI_AUTH_TRUSTED_EMAIL_HEADER:
+        return True
+
+    trusted_email = _get_header_case_insensitive(headers, WEBUI_AUTH_TRUSTED_EMAIL_HEADER).strip().lower()
+    if decoded.get('auth_method') == 'trusted_header':
+        return bool(trusted_email and user.email.lower() == trusted_email)
+
+    return not trusted_email or user.email.lower() == trusted_email
+
+
+async def token_meets_mfa_requirements(decoded: dict, user, enable_totp) -> bool:
+    from open_webui.models.oauth_sessions import OAuthSessions
+    from open_webui.models.totp import UserTOTPs
+
+    token_auth_state_version = get_token_auth_state_version(decoded)
+    user_auth_state_version = getattr(user, 'auth_state_version', 0) or 0
+    if token_auth_state_version != user_auth_state_version:
+        return False
+
+    oauth_session_id = decoded.get('oauth_session_id')
+    auth_method = decoded.get('auth_method')
+    if auth_method in {'oauth', 'oauth_token_exchange'} and not oauth_session_id:
+        return False
+
+    if oauth_session_id:
+        oauth_provider = decoded.get('oauth_provider')
+        if not oauth_provider:
+            return False
+
+        oauth_session = await OAuthSessions.get_session_identity_by_id(oauth_session_id)
+        if not oauth_session:
+            return False
+        if oauth_session.user_id != user.id or oauth_session.provider != oauth_provider:
+            return False
+        if decoded.get('oauth_sid') and oauth_session.sid != decoded.get('oauth_sid'):
+            return False
+        if oauth_session.expires_at is not None and oauth_session.expires_at <= int(datetime.now(UTC).timestamp()):
+            await OAuthSessions.delete_session_by_id(oauth_session.id)
+            try:
+                from open_webui.utils.sessions import disconnect_user_oauth_live_sessions
+
+                await disconnect_user_oauth_live_sessions(
+                    user.id,
+                    oauth_provider,
+                    sid=oauth_session.sid,
+                    session_ids={oauth_session.id},
+                )
+            except Exception:
+                log.warning('Failed to disconnect expired OAuth live sessions for user %s', user.id, exc_info=True)
+            return False
+    user_totp = await UserTOTPs.get_user_totp_by_user_id(user.id)
+    if not user_totp:
+        return True
+
+    state_version = user_totp.backup_code_version or 0
+    token_state_version = get_token_totp_state_version(decoded)
+    pending_setup = bool(user_totp.secret and not user_totp.enabled)
+
+    # Pending setup keeps a secret while disabled, so the setup session must
+    # remain valid for /totp/enable. All other TOTP rows require an exact state
+    # version match, which avoids same-second token/state races.
+    if not pending_setup and token_state_version != state_version:
+        return False
+
+    if not is_config_enabled(enable_totp):
+        return True
+
+    if not user_totp.enabled or not user_totp.secret:
+        return True
+
+    mfa = decoded.get('mfa') or {}
+    return bool(mfa.get('totp')) and get_token_totp_state_version(decoded) == state_version
+
+
+async def is_valid_decoded_token(decoded, redis_client, user_id: str | None = None) -> bool:
     """
     Check whether a JWT has been revoked. Two mechanisms:
     1. Per-token (jti) — used by user-initiated sign-out (known jti).
     2. Per-user (revoked_at) — used by OIDC back-channel logout when
-       individual jti values are unknown; rejects tokens with iat <= revoked_at.
+       individual jti values are unknown; rejects tokens with iat < revoked_at.
     """
-    if request.app.state.redis:
+    expires_at = get_token_expires_at(decoded)
+    if expires_at is not None and expires_at <= int(datetime.now(UTC).timestamp()):
+        return False
+
+    if decoded.get('exp') is not None and expires_at is None:
+        return False
+
+    if redis_client:
         # Per-token revocation
         jti = decoded.get('jti')
         if jti:
-            revoked = await request.app.state.redis.get(f'{REDIS_KEY_PREFIX}:auth:token:{jti}:revoked')
+            revoked = await redis_client.get(f'{REDIS_KEY_PREFIX}:auth:token:{jti}:revoked')
             if revoked:
                 return False
 
         # Per-user revocation (OIDC back-channel logout)
-        user_id = decoded.get('id')
+        user_id = user_id or decoded.get('id')
         if user_id:
-            revoked_at = await request.app.state.redis.get(f'{REDIS_KEY_PREFIX}:auth:user:{user_id}:revoked_at')
+            revoked_at = await redis_client.get(f'{REDIS_KEY_PREFIX}:auth:user:{user_id}:revoked_at')
             if revoked_at:
                 try:
                     revoked_at_ts = int(revoked_at)
-                    token_iat = decoded.get('iat')
+                    token_iat = get_token_issued_at(decoded)
                     # No iat means legacy token — reject since we can't verify issue time
-                    if token_iat is None or token_iat <= revoked_at_ts:
+                    if token_iat is None or token_iat < revoked_at_ts:
                         return False
                 except (ValueError, TypeError):
                     pass
 
     return True
+
+
+async def is_valid_token(request, decoded) -> bool:
+    return await is_valid_decoded_token(decoded, request.app.state.redis)
 
 
 async def invalidate_token(request, token):
@@ -267,6 +433,13 @@ async def invalidate_token(request, token):
                     '1',
                     ex=ttl,
                 )
+        elif jti:
+            # Tokens created with JWT_EXPIRES_IN=-1 or 0 have no exp, so the
+            # revocation marker must be unbounded too.
+            await request.app.state.redis.set(
+                f'{REDIS_KEY_PREFIX}:auth:token:{jti}:revoked',
+                '1',
+            )
 
 
 def extract_token_from_auth_header(auth_header: str):
@@ -286,6 +459,45 @@ def get_http_authorization_cred(auth_header: str | None):
         return HTTPAuthorizationCredentials(scheme=scheme, credentials=credentials)
     except Exception:
         return None
+
+
+def get_request_auth_token(request: Request) -> str | None:
+    auth_header = request.headers.get('Authorization')
+    if auth_header:
+        auth_cred = get_http_authorization_cred(auth_header)
+        if auth_cred is not None:
+            return auth_cred.credentials
+
+    if request.cookies.get('token'):
+        return request.cookies.get('token')
+
+    if getattr(request.state, 'token', None):
+        return request.state.token.credentials
+
+    return None
+
+
+def get_oauth_token_binding_claims(decoded: dict | None) -> dict:
+    if not decoded:
+        return {}
+
+    oauth_session_id = decoded.get('oauth_session_id')
+    oauth_provider = decoded.get('oauth_provider')
+    if not oauth_session_id or not oauth_provider:
+        return {}
+
+    claims = {
+        'oauth_session_id': oauth_session_id,
+        'oauth_provider': oauth_provider,
+    }
+    if decoded.get('oauth_sid'):
+        claims['oauth_sid'] = decoded['oauth_sid']
+    return claims
+
+
+def get_request_oauth_token_binding_claims(request: Request) -> dict:
+    token = get_request_auth_token(request)
+    return get_oauth_token_binding_claims(decode_token(token)) if token else {}
 
 
 async def get_current_user(
@@ -341,7 +553,7 @@ async def get_current_user(
             )
 
         if data is not None and 'id' in data:
-            if data.get('jti') and not await is_valid_token(request, data):
+            if not await is_valid_token(request, data):
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail='Invalid token',
@@ -354,13 +566,27 @@ async def get_current_user(
                     detail=ERROR_MESSAGES.INVALID_TOKEN,
                 )
             else:
-                if WEBUI_AUTH_TRUSTED_EMAIL_HEADER:
-                    trusted_email = request.headers.get(WEBUI_AUTH_TRUSTED_EMAIL_HEADER, '').lower()
-                    if trusted_email and user.email != trusted_email:
-                        raise HTTPException(
-                            status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail='User mismatch. Please sign in again.',
-                        )
+                try:
+                    mfa_allowed = await token_meets_mfa_requirements(
+                        data,
+                        user,
+                        request.app.state.config.ENABLE_TOTP,
+                    )
+                except Exception:
+                    log.exception('Failed to validate MFA requirements')
+                    mfa_allowed = False
+
+                if not mfa_allowed:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail=ERROR_MESSAGES.INVALID_TOKEN,
+                    )
+
+                if not token_meets_trusted_header_requirements(data, user, request.headers):
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail='User mismatch. Please sign in again.',
+                    )
 
                 # Add user info to current span
                 if ENABLE_OTEL:
@@ -419,6 +645,12 @@ async def get_current_user_by_api_key(request, api_key: str):
     ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.API_KEY_NOT_ALLOWED)
 
+    if is_config_enabled(request.app.state.config.ENABLE_TOTP):
+        from open_webui.models.totp import UserTOTPs
+
+        if await UserTOTPs.is_totp_enabled_by_user_id(user.id):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.API_KEY_NOT_ALLOWED)
+
     # Enforce endpoint restrictions — checked here (not in middleware)
     # so it applies regardless of how the API key was transported
     # (Authorization header, cookie, x-api-key header, etc.).
@@ -450,7 +682,7 @@ async def get_current_user_by_api_key(request, api_key: str):
 
 
 def get_verified_user(user=Depends(get_current_user)):
-    if user.role not in {'user', 'admin'}:
+    if not is_verified_user_role(user):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -477,25 +709,32 @@ async def create_admin_user(email: str, password: str, name: str = 'Admin'):
     if not email or not password:
         return None
 
-    if await Users.has_users():
-        log.debug('Users already exist, skipping admin creation')
-        return None
-
     log.info(f'Creating admin account from environment variables: {email}')
     try:
-        hashed = get_password_hash(password)
-        user = await Auths.insert_new_auth(
-            email=email.lower(),
-            password=hashed,
-            name=name,
-            role='admin',
-        )
+        async with get_async_db() as db:
+            async with bootstrap_user_creation_lock(db):
+                if await Users.get_num_users(db=db):
+                    log.debug('Users already exist, skipping admin creation')
+                    return None
+
+                hashed = get_password_hash(password)
+                user = await Auths.insert_new_auth(
+                    email=email.lower(),
+                    password=hashed,
+                    name=name,
+                    role='admin',
+                    db=db,
+                    commit=False,
+                )
+                if not user:
+                    await db.rollback()
+                    log.error('Failed to create admin account from environment variables')
+                    return None
+                await db.commit()
+
         if user:
             log.info(f'Admin account created successfully: {email}')
             return user
-        else:
-            log.error('Failed to create admin account from environment variables')
-            return None
     except Exception as e:
         log.error(f'Error creating admin account: {e}')
         return None

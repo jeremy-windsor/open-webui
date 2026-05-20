@@ -488,6 +488,7 @@ type UserUpdateForm = {
 	email: string;
 	name: string;
 	password: string;
+	current_password?: string;
 };
 
 export const updateUserById = async (token: string, userId: string, user: UserUpdateForm) => {
@@ -504,7 +505,8 @@ export const updateUserById = async (token: string, userId: string, user: UserUp
 			role: user.role,
 			email: user.email,
 			name: user.name,
-			password: user.password !== '' ? user.password : undefined
+			password: user.password !== '' ? user.password : undefined,
+			current_password: user.current_password !== '' ? user.current_password : undefined
 		})
 	})
 		.then(async (res) => {
@@ -551,7 +553,15 @@ export const getUserTOTPStatusById = async (token: string, userId: string) => {
 	return res;
 };
 
-export const disableUserTOTPById = async (token: string, userId: string) => {
+export const disableUserTOTPById = async (
+	token: string,
+	userId: string,
+	credentials: {
+		password?: string;
+		code?: string;
+		backup_code?: string;
+	}
+) => {
 	let error = null;
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/users/${userId}/totp`, {
@@ -559,7 +569,8 @@ export const disableUserTOTPById = async (token: string, userId: string) => {
 		headers: {
 			'Content-Type': 'application/json',
 			Authorization: `Bearer ${token}`
-		}
+		},
+		body: JSON.stringify(credentials)
 	})
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();

@@ -26,6 +26,7 @@ from open_webui.utils.auth import (
     get_current_user,
     get_verified_user,
 )
+from open_webui.utils.sessions import disconnect_user_live_sessions, disconnect_users_live_sessions
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -678,12 +679,15 @@ async def update_user(
     if user_data.photos and len(user_data.photos) > 0:
         update_data['profile_image_url'] = user_data.photos[0].value
 
+    role_changed = 'role' in update_data and update_data['role'] != user.role
     updated_user = await Users.update_user_by_id(user_id, update_data, db=db)
     if not updated_user:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to update user',
         )
+    if role_changed:
+        await disconnect_user_live_sessions(user_id)
 
     # Update externalId in the scim field
     if user_data.externalId:
@@ -734,12 +738,15 @@ async def patch_user(
 
     # Update user
     if update_data:
+        role_changed = 'role' in update_data and update_data['role'] != user.role
         updated_user = await Users.update_user_by_id(user_id, update_data, db=db)
         if not updated_user:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail='Failed to update user',
             )
+        if role_changed:
+            await disconnect_user_live_sessions(user_id)
     else:
         updated_user = user
 
@@ -767,6 +774,7 @@ async def delete_user(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to delete user',
         )
+    await disconnect_user_live_sessions(user_id)
 
     return None
 
@@ -882,6 +890,7 @@ async def create_group(
 
         await Groups.update_group_by_id(new_group.id, update_form, db=db)
         await Groups.set_group_user_ids_by_id(new_group.id, member_ids, db=db)
+        await disconnect_users_live_sessions(member_ids)
 
         new_group = await Groups.get_group_by_id(new_group.id, db=db)
 
@@ -914,8 +923,10 @@ async def update_group(
 
     # Handle members if provided
     if group_data.members is not None:
+        existing_member_ids = await Groups.get_group_user_ids_by_id(group_id, db=db)
         member_ids = [member.value for member in group_data.members]
         await Groups.set_group_user_ids_by_id(group_id, member_ids, db=db)
+        await disconnect_users_live_sessions(set(existing_member_ids) | set(member_ids))
 
     # Update group
     updated_group = await Groups.update_group_by_id(group_id, update_form, db=db)
@@ -961,7 +972,10 @@ async def patch_group(
                 update_form.name = value
             elif path == 'members':
                 # Replace all members
-                await Groups.set_group_user_ids_by_id(group_id, [member['value'] for member in value], db=db)
+                existing_member_ids = await Groups.get_group_user_ids_by_id(group_id, db=db)
+                member_ids = [member['value'] for member in value]
+                await Groups.set_group_user_ids_by_id(group_id, member_ids, db=db)
+                await disconnect_users_live_sessions(set(existing_member_ids) | set(member_ids))
 
         elif op == 'add':
             if path == 'members':
@@ -969,12 +983,16 @@ async def patch_group(
                 if isinstance(value, list):
                     for member in value:
                         if isinstance(member, dict) and 'value' in member:
-                            await Groups.add_users_to_group(group_id, [member['value']], db=db)
+                            if not await Groups.add_users_to_group(group_id, [member['value']], db=db):
+                                raise HTTPException(500, detail='Failed to update group members')
+                            await disconnect_user_live_sessions(member['value'])
         elif op == 'remove':
             if path and path.startswith('members[value eq'):
                 # Remove specific member
                 member_id = path.split('"')[1]
-                await Groups.remove_users_from_group(group_id, [member_id], db=db)
+                if not await Groups.remove_users_from_group(group_id, [member_id], db=db):
+                    raise HTTPException(500, detail='Failed to update group members')
+                await disconnect_user_live_sessions(member_id)
 
     # Update group
     updated_group = await Groups.update_group_by_id(group_id, update_form, db=db)
@@ -1002,11 +1020,13 @@ async def delete_group(
             detail=f'Group {group_id} not found',
         )
 
+    affected_user_ids = await Groups.get_group_user_ids_by_id(group_id, db=db)
     success = await Groups.delete_group_by_id(group_id, db=db)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to delete group',
         )
+    await disconnect_users_live_sessions(affected_user_ids)
 
     return None

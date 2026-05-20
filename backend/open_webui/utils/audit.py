@@ -1,4 +1,5 @@
 import re
+import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
@@ -217,6 +218,7 @@ class AuditLoggingMiddleware:
             '/api/v1/auths/signin',
             '/api/v1/auths/signout',
             '/api/v1/auths/signup',
+            '/api/v1/auths/totp',
         }
         path = request.url.path.lower()
         for endpoint in ALWAYS_LOG_ENDPOINTS:
@@ -242,6 +244,49 @@ class AuditLoggingMiddleware:
 
         return False
 
+    def _redact_sensitive_text(self, value: str) -> str:
+        value = re.sub(
+            r'"([^"]*(?:api_key|backup_code|code|mfa_token|otpauth_url|password|secret|token)[^"]*)":\s*"(.*?)"',
+            r'"\1": "********"',
+            value,
+        )
+
+        if 'backup_codes' in value:
+            value = re.sub(
+                r'"([^"]*backup_codes[^"]*)":\s*\[(.*?)\]',
+                r'"\1": ["********"]',
+                value,
+                flags=re.DOTALL,
+            )
+
+        return value
+
+    def _redact_sensitive_url(self, value: str) -> str:
+        parsed = urllib.parse.urlsplit(value)
+        if not parsed.query:
+            return value
+
+        sensitive_keys = (
+            'api_key',
+            'backup_code',
+            'code',
+            'mfa_token',
+            'otpauth_url',
+            'password',
+            'secret',
+            'state',
+            'token',
+        )
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        redacted_query = urllib.parse.urlencode(
+            [
+                (key, '********' if any(sensitive_key in key.lower() for sensitive_key in sensitive_keys) else val)
+                for key, val in query
+            ],
+            doseq=True,
+        )
+        return urllib.parse.urlunsplit(parsed._replace(query=redacted_query))
+
     async def _capture_request(self, message: ASGIReceiveEvent, context: AuditContext):
         if message['type'] == 'http.request':
             body = message.get('body', b'')
@@ -264,20 +309,15 @@ class AuditLoggingMiddleware:
             request_body = context.request_body.decode('utf-8', errors='replace')
             response_body = context.response_body.decode('utf-8', errors='replace')
 
-            # Redact sensitive information
-            if 'password' in request_body:
-                request_body = re.sub(
-                    r'"password":\s*"(.*?)"',
-                    '"password": "********"',
-                    request_body,
-                )
+            request_body = self._redact_sensitive_text(request_body)
+            response_body = self._redact_sensitive_text(response_body)
 
             entry = AuditLogEntry(
                 id=str(uuid.uuid4()),
                 user=user,
                 audit_level=self.audit_level.value,
                 verb=request.method,
-                request_uri=str(request.url),
+                request_uri=self._redact_sensitive_url(str(request.url)),
                 response_status_code=context.metadata.get('response_status_code', None),
                 source_ip=request.client.host if request.client else None,
                 user_agent=request.headers.get('user-agent'),

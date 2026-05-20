@@ -11,6 +11,7 @@ import pycrdt as Y
 import socketio
 from open_webui.config import (
     CORS_ALLOW_ORIGIN,
+    ENABLE_TOTP,
 )
 from open_webui.env import (
     ENABLE_WEBSOCKET_SUPPORT,
@@ -38,7 +39,14 @@ from open_webui.models.users import UserNameResponse, Users
 from open_webui.socket.utils import RedisDict, RedisLock, YdocManager
 from open_webui.tasks import create_task, stop_item_tasks
 from open_webui.utils.access_control import has_permission
-from open_webui.utils.auth import decode_token
+from open_webui.utils.auth import (
+    decode_token,
+    is_config_enabled,
+    is_valid_decoded_token,
+    is_verified_user_role,
+    token_meets_mfa_requirements,
+    token_meets_trusted_header_requirements,
+)
 from open_webui.utils.redis import (
     build_sentinel_url,
     get_redis_connection,
@@ -94,6 +102,7 @@ else:
 # Timeout duration in seconds
 TIMEOUT_DURATION = 3
 SESSION_POOL_TIMEOUT = 120  # seconds without heartbeat before session is reaped
+SOCKET_AUTH_REVALIDATION_INTERVAL = 15
 
 # Dictionary to maintain the user pool
 
@@ -324,9 +333,221 @@ async def disconnect_user_sessions(user_id: str):
         log.warning(f'Failed to disconnect sessions for user {user_id}: {e}')
 
 
+def _token_matches_oauth_session(
+    token_data: dict | None,
+    provider: str,
+    sid: str | None = None,
+    session_ids: set[str] | None = None,
+) -> bool:
+    if not isinstance(token_data, dict):
+        return False
+    if token_data.get('oauth_provider') != provider:
+        return False
+    if sid and token_data.get('oauth_sid') != sid:
+        return False
+    if session_ids and token_data.get('oauth_session_id') not in session_ids:
+        return False
+    return True
+
+
+async def disconnect_user_oauth_sessions(
+    user_id: str,
+    provider: str,
+    sid: str | None = None,
+    session_ids: set[str] | None = None,
+):
+    try:
+        room_session_ids = get_session_ids_from_room(f'user:{user_id}')
+        disconnected = 0
+        for socket_id in room_session_ids:
+            token_data = (SESSION_POOL.get(socket_id) or {}).get('_token_data')
+            if _token_matches_oauth_session(token_data, provider, sid=sid, session_ids=session_ids):
+                await sio.disconnect(socket_id)
+                disconnected += 1
+        if disconnected:
+            log.info(
+                'Disconnected %s OAuth-bound socket session(s) for user %s provider %s',
+                disconnected,
+                user_id,
+                provider,
+            )
+    except Exception as e:
+        log.warning(f'Failed to disconnect OAuth-bound sessions for user {user_id}: {e}')
+
+
+def get_socket_app(environ: dict | None = None):
+    if environ:
+        scope = environ.get('asgi.scope') or {}
+        return scope.get('app')
+
+    return None
+
+
+def get_socket_enable_totp(environ: dict | None = None) -> bool:
+    scope_app = get_socket_app(environ)
+    if scope_app is not None:
+        app_config = getattr(getattr(scope_app, 'state', None), 'config', None)
+        if app_config is not None:
+            try:
+                return is_config_enabled(app_config.ENABLE_TOTP)
+            except Exception:
+                pass
+
+    return is_config_enabled(ENABLE_TOTP.value)
+
+
+def get_socket_headers(environ: dict | None = None) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    scope = (environ or {}).get('asgi.scope') or {}
+    for key, value in scope.get('headers') or []:
+        try:
+            header_name = key.decode('latin1') if isinstance(key, bytes) else str(key)
+            header_value = value.decode('latin1') if isinstance(value, bytes) else str(value)
+            headers[header_name] = header_value
+        except Exception:
+            continue
+
+    for key, value in (environ or {}).items():
+        if not isinstance(key, str) or not key.startswith('HTTP_'):
+            continue
+        header_name = key[5:].replace('_', '-').lower()
+        headers.setdefault(header_name, str(value))
+
+    return headers
+
+
+def _public_session_data(session_entry: dict) -> dict:
+    return {key: value for key, value in session_entry.items() if not key.startswith('_')}
+
+
+def _session_entry_for_user(user, token_data: dict, last_seen_at: int | None = None) -> dict:
+    now = int(time.time())
+    return {
+        **user.model_dump(
+            exclude=[
+                'profile_image_url',
+                'profile_banner_image_url',
+                'date_of_birth',
+                'bio',
+                'gender',
+            ]
+        ),
+        '_token_data': token_data,
+        '_auth_checked_at': now,
+        'last_seen_at': last_seen_at or now,
+    }
+
+
+async def get_user_from_token_data(data: dict, environ: dict | None = None):
+    if data is None or 'id' not in data:
+        return None
+
+    scope_app = get_socket_app(environ)
+    redis_client = getattr(getattr(scope_app, 'state', None), 'redis', None)
+    try:
+        token_valid = await is_valid_decoded_token(data, redis_client)
+    except Exception:
+        log.exception('Failed to validate socket token revocation state')
+        return None
+
+    if not token_valid:
+        return None
+
+    user = await Users.get_user_by_id(data['id'])
+    if not user:
+        return None
+    if not is_verified_user_role(user):
+        return None
+
+    if not token_meets_trusted_header_requirements(data, user, get_socket_headers(environ)):
+        return None
+
+    try:
+        mfa_allowed = await token_meets_mfa_requirements(data, user, get_socket_enable_totp(environ))
+    except Exception:
+        log.exception('Failed to validate socket MFA requirements')
+        return None
+
+    if not mfa_allowed:
+        return None
+
+    return user
+
+
+async def get_user_and_token_from_token(token: str, environ: dict | None = None):
+    data = decode_token(token)
+    user = await get_user_from_token_data(data, environ)
+    if not user:
+        return None, None
+
+    return user, data
+
+
+async def get_user_from_token(token: str, environ: dict | None = None):
+    user, _ = await get_user_and_token_from_token(token, environ)
+    return user
+
+
+async def bind_socket_session_to_token(sid: str, token: str, environ: dict | None = None):
+    user, token_data = await get_user_and_token_from_token(token, environ)
+    if not user:
+        return None
+
+    existing_session = SESSION_POOL.get(sid)
+    if existing_session and existing_session.get('id') != user.id:
+        log.warning('Disconnecting socket session %s: attempted user switch', sid)
+        if sid in SESSION_POOL:
+            del SESSION_POOL[sid]
+        await sio.disconnect(sid)
+        return None
+
+    SESSION_POOL[sid] = _session_entry_for_user(
+        user,
+        token_data,
+        last_seen_at=existing_session.get('last_seen_at') if existing_session else None,
+    )
+    await sio.enter_room(sid, f'user:{user.id}')
+    return user
+
+
+async def get_valid_session_entry(sid, *, force: bool = False):
+    session_entry = SESSION_POOL.get(sid)
+    if not session_entry:
+        return None
+
+    now = int(time.time())
+    if not force and now - session_entry.get('_auth_checked_at', 0) < SOCKET_AUTH_REVALIDATION_INTERVAL:
+        return session_entry
+
+    token_data = session_entry.get('_token_data')
+    if not isinstance(token_data, dict):
+        log.warning(f'Disconnecting socket session {sid}: missing token claims')
+        if sid in SESSION_POOL:
+            del SESSION_POOL[sid]
+        await sio.disconnect(sid)
+        return None
+
+    try:
+        environ = sio.get_environ(sid)
+    except Exception:
+        environ = None
+
+    user = await get_user_from_token_data(token_data, environ)
+    if not user:
+        log.warning(f'Disconnecting socket session {sid}: token is no longer valid')
+        if sid in SESSION_POOL:
+            del SESSION_POOL[sid]
+        await sio.disconnect(sid)
+        return None
+
+    session_entry = _session_entry_for_user(user, token_data, last_seen_at=session_entry.get('last_seen_at'))
+    SESSION_POOL[sid] = session_entry
+    return session_entry
+
+
 @sio.on('usage')
 async def usage(sid, data):
-    if sid in SESSION_POOL:
+    if await get_valid_session_entry(sid):
         model_id = data['model']
         # Record the timestamp for the last update
         current_time = int(time.time())
@@ -340,27 +561,10 @@ async def usage(sid, data):
 
 @sio.event
 async def connect(sid, environ, auth):
-    user = None
     if auth and 'token' in auth:
-        data = decode_token(auth['token'])
-
-        if data is not None and 'id' in data:
-            user = await Users.get_user_by_id(data['id'])
-
-        if user:
-            SESSION_POOL[sid] = {
-                **user.model_dump(
-                    exclude=[
-                        'profile_image_url',
-                        'profile_banner_image_url',
-                        'date_of_birth',
-                        'bio',
-                        'gender',
-                    ]
-                ),
-                'last_seen_at': int(time.time()),
-            }
-            await sio.enter_room(sid, f'user:{user.id}')
+        user = await bind_socket_session_to_token(sid, auth['token'], environ)
+        if not user:
+            await sio.disconnect(sid)
 
 
 @sio.on('user-join')
@@ -369,28 +573,9 @@ async def user_join(sid, data):
     if not auth or 'token' not in auth:
         return
 
-    token_data = decode_token(auth['token'])
-    if token_data is None or 'id' not in token_data:
-        return
-
-    user = await Users.get_user_by_id(token_data['id'])
+    user = await bind_socket_session_to_token(sid, auth['token'], sio.get_environ(sid))
     if not user:
         return
-
-    SESSION_POOL[sid] = {
-        **user.model_dump(
-            exclude=[
-                'profile_image_url',
-                'profile_banner_image_url',
-                'date_of_birth',
-                'bio',
-                'gender',
-            ]
-        ),
-        'last_seen_at': int(time.time()),
-    }
-
-    await sio.enter_room(sid, f'user:{user.id}')
 
     # Join all the channels only if user has channels permission
     if user.role == 'admin' or await has_permission(user.id, 'features.channels'):
@@ -404,7 +589,7 @@ async def user_join(sid, data):
 
 @sio.on('heartbeat')
 async def heartbeat(sid, data):
-    user = SESSION_POOL.get(sid)
+    user = await get_valid_session_entry(sid, force=True)
     if user:
         SESSION_POOL[sid] = {**user, 'last_seen_at': int(time.time())}
         await Users.update_last_active_by_id(user['id'])
@@ -416,11 +601,7 @@ async def join_channel(sid, data):
     if not auth or 'token' not in auth:
         return
 
-    data = decode_token(auth['token'])
-    if data is None or 'id' not in data:
-        return
-
-    user = await Users.get_user_by_id(data['id'])
+    user = await bind_socket_session_to_token(sid, auth['token'], sio.get_environ(sid))
     if not user:
         return
 
@@ -438,11 +619,7 @@ async def join_note(sid, data):
     if not auth or 'token' not in auth:
         return
 
-    token_data = decode_token(auth['token'])
-    if token_data is None or 'id' not in token_data:
-        return
-
-    user = await Users.get_user_by_id(token_data['id'])
+    user = await bind_socket_session_to_token(sid, auth['token'], sio.get_environ(sid))
     if not user:
         return
 
@@ -470,6 +647,10 @@ async def join_note(sid, data):
 
 @sio.on('events:channel')
 async def channel_events(sid, data):
+    user = await get_valid_session_entry(sid)
+    if not user:
+        return
+
     room = f'channel:{data["channel_id"]}'
     participants = sio.manager.get_participants(
         namespace='/',
@@ -483,11 +664,6 @@ async def channel_events(sid, data):
     event_data = data['data']
     event_type = event_data['type']
 
-    user = SESSION_POOL.get(sid)
-
-    if not user:
-        return
-
     if event_type == 'typing':
         await sio.emit(
             'events:channel',
@@ -495,7 +671,7 @@ async def channel_events(sid, data):
                 'channel_id': data['channel_id'],
                 'message_id': data.get('message_id', None),
                 'data': event_data,
-                'user': UserNameResponse(**user).model_dump(),
+                'user': UserNameResponse(**_public_session_data(user)).model_dump(),
             },
             room=room,
         )
@@ -505,7 +681,7 @@ async def channel_events(sid, data):
 
 @sio.on('events:chat')
 async def chat_events(sid, data):
-    user = SESSION_POOL.get(sid)
+    user = await get_valid_session_entry(sid)
     if not user:
         return
 
@@ -532,7 +708,7 @@ def normalize_document_id(document_id: str) -> str:
 @sio.on('ydoc:document:join')
 async def ydoc_document_join(sid, data):
     """Handle user joining a document"""
-    user = SESSION_POOL.get(sid)
+    user = await get_valid_session_entry(sid)
     if not user:
         return
 
@@ -639,6 +815,9 @@ async def document_save_handler(document_id, data, user):
 async def yjs_document_state(sid, data):
     """Send the current state of the Yjs document to the user"""
     try:
+        if not await get_valid_session_entry(sid):
+            return
+
         document_id = data['document_id']
 
         document_id = normalize_document_id(document_id)
@@ -692,7 +871,7 @@ async def yjs_document_update(sid, data):
             return
 
         # Verify write permission — room membership only proves read access
-        user = SESSION_POOL.get(sid)
+        user = await get_valid_session_entry(sid)
         if not user:
             return
 
@@ -758,6 +937,9 @@ async def yjs_document_update(sid, data):
 async def yjs_document_leave(sid, data):
     """Handle user leaving a document"""
     try:
+        if not await get_valid_session_entry(sid):
+            return
+
         document_id = normalize_document_id(data['document_id'])
         user_id = data.get('user_id', sid)
 
@@ -788,7 +970,12 @@ async def yjs_document_leave(sid, data):
 async def yjs_awareness_update(sid, data):
     """Handle awareness updates (cursors, selections, etc.)"""
     try:
-        document_id = data['document_id']
+        document_id = normalize_document_id(data['document_id'])
+        room = f'doc_{document_id}'
+        if sid not in get_session_ids_from_room(room) or not await get_valid_session_entry(sid):
+            log.warning(f'Session {sid} not in room {room}. Rejecting awareness update.')
+            return
+
         user_id = data.get('user_id', sid)
         update = data['update']
 
@@ -796,7 +983,7 @@ async def yjs_awareness_update(sid, data):
         await sio.emit(
             'ydoc:awareness:update',
             {'document_id': document_id, 'user_id': user_id, 'update': update},
-            room=f'doc_{document_id}',
+            room=room,
             skip_sid=sid,
         )
 

@@ -23,6 +23,7 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
@@ -514,60 +515,72 @@ class GroupTable:
     async def sync_groups_by_group_names(
         self, user_id: str, group_names: list[str], db: Optional[AsyncSession] = None
     ) -> bool:
-        async with get_async_db_context(db) as db:
-            try:
-                now = int(time.time())
+        for attempt in range(3):
+            async with get_async_db_context(db) as session:
+                try:
+                    now = int(time.time())
 
-                # 1. Groups that SHOULD contain the user
-                result = await db.execute(select(Group).filter(Group.name.in_(group_names)))
-                target_groups = result.scalars().all()
-                target_group_ids = {g.id for g in target_groups}
+                    # 1. Groups that SHOULD contain the user
+                    result = await session.execute(select(Group).filter(Group.name.in_(group_names)))
+                    target_groups = result.scalars().all()
+                    target_group_ids = {g.id for g in target_groups}
 
-                # 2. Groups the user is CURRENTLY in
-                result = await db.execute(
-                    select(Group)
-                    .join(GroupMember, GroupMember.group_id == Group.id)
-                    .filter(GroupMember.user_id == user_id)
-                )
-                existing_group_ids = {g.id for g in result.scalars().all()}
-
-                # 3. Determine adds + removals
-                groups_to_add = target_group_ids - existing_group_ids
-                groups_to_remove = existing_group_ids - target_group_ids
-
-                # 4. Remove in one bulk delete
-                if groups_to_remove:
-                    await db.execute(
-                        delete(GroupMember).filter(
-                            GroupMember.user_id == user_id,
-                            GroupMember.group_id.in_(groups_to_remove),
-                        )
+                    # 2. Groups the user is CURRENTLY in
+                    result = await session.execute(
+                        select(Group)
+                        .join(GroupMember, GroupMember.group_id == Group.id)
+                        .filter(GroupMember.user_id == user_id)
                     )
+                    existing_group_ids = {g.id for g in result.scalars().all()}
 
-                    await db.execute(update(Group).filter(Group.id.in_(groups_to_remove)).values(updated_at=now))
+                    # 3. Determine adds + removals
+                    groups_to_add = target_group_ids - existing_group_ids
+                    groups_to_remove = existing_group_ids - target_group_ids
 
-                # 5. Bulk insert missing memberships
-                for group_id in groups_to_add:
-                    db.add(
-                        GroupMember(
-                            id=str(uuid.uuid4()),
-                            group_id=group_id,
-                            user_id=user_id,
-                            created_at=now,
-                            updated_at=now,
+                    # 4. Remove in one bulk delete
+                    if groups_to_remove:
+                        await session.execute(
+                            delete(GroupMember).filter(
+                                GroupMember.user_id == user_id,
+                                GroupMember.group_id.in_(groups_to_remove),
+                            )
                         )
-                    )
 
-                if groups_to_add:
-                    await db.execute(update(Group).filter(Group.id.in_(groups_to_add)).values(updated_at=now))
+                        await session.execute(update(Group).filter(Group.id.in_(groups_to_remove)).values(updated_at=now))
 
-                await db.commit()
-                return True
+                    # 5. Bulk insert missing memberships
+                    for group_id in groups_to_add:
+                        session.add(
+                            GroupMember(
+                                id=str(uuid.uuid4()),
+                                group_id=group_id,
+                                user_id=user_id,
+                                created_at=now,
+                                updated_at=now,
+                            )
+                        )
 
-            except Exception as e:
-                log.exception(e)
-                await db.rollback()
-                return False
+                    if groups_to_add:
+                        try:
+                            await session.flush()
+                        except IntegrityError:
+                            await session.rollback()
+                            raise
+                        await session.execute(update(Group).filter(Group.id.in_(groups_to_add)).values(updated_at=now))
+
+                    await session.commit()
+                    return True
+
+                except IntegrityError:
+                    log.warning('Concurrent group sync detected for user %s; retrying', user_id)
+                    if attempt == 2:
+                        return False
+                except Exception as e:
+                    log.exception(e)
+                    await session.rollback()
+                    return False
+
+        return False
 
     async def add_users_to_group(
         self,
@@ -575,18 +588,32 @@ class GroupTable:
         user_ids: Optional[list[str]] = None,
         db: Optional[AsyncSession] = None,
     ) -> Optional[GroupModel]:
-        try:
-            async with get_async_db_context(db) as db:
-                result = await db.execute(select(Group).filter_by(id=id))
-                group = result.scalars().first()
-                if not group:
-                    return None
+        for attempt in range(3):
+            try:
+                async with get_async_db_context(db) as session:
+                    result = await session.execute(select(Group).filter_by(id=id))
+                    group = result.scalars().first()
+                    if not group:
+                        return None
 
-                now = int(time.time())
+                    now = int(time.time())
 
-                for user_id in user_ids or []:
-                    try:
-                        db.add(
+                    requested_user_ids = list(dict.fromkeys(user_ids or []))
+                    existing_user_ids = set()
+                    if requested_user_ids:
+                        result = await session.execute(
+                            select(GroupMember.user_id).filter(
+                                GroupMember.group_id == id,
+                                GroupMember.user_id.in_(requested_user_ids),
+                            )
+                        )
+                        existing_user_ids = set(result.scalars().all())
+
+                    for user_id in requested_user_ids:
+                        if user_id in existing_user_ids:
+                            continue
+
+                        session.add(
                             GroupMember(
                                 id=str(uuid.uuid4()),
                                 group_id=id,
@@ -595,20 +622,24 @@ class GroupTable:
                                 updated_at=now,
                             )
                         )
-                        await db.flush()  # Detect unique constraint violation early
-                    except Exception:
-                        await db.rollback()  # Clear failed INSERT
-                        continue  # Duplicate → ignore
 
-                group.updated_at = now
-                await db.commit()
-                await db.refresh(group)
+                    try:
+                        await session.flush()
+                    except IntegrityError:
+                        await session.rollback()
+                        raise
 
-                return GroupModel.model_validate(group)
+                    group.updated_at = now
+                    await session.commit()
+                    await session.refresh(group)
 
-        except Exception as e:
-            log.exception(e)
-            return None
+                    return GroupModel.model_validate(group)
+            except IntegrityError:
+                log.warning('Concurrent group membership add detected for group %s; retrying', id)
+                if attempt == 2:
+                    raise
+
+        return None
 
     async def remove_users_from_group(
         self,

@@ -206,6 +206,7 @@ from open_webui.config import (
     ENABLE_SIGNUP,
     ENABLE_TAGS_GENERATION,
     ENABLE_TITLE_GENERATION,
+    ENABLE_TOTP,
     ENABLE_USER_STATUS,
     ENABLE_USER_WEBHOOKS,
     ENABLE_VOICE_MODE_PROMPT,
@@ -471,6 +472,7 @@ from open_webui.internal.db import ScopedSession, engine, get_async_session
 from open_webui.models.chats import ChatForm, Chats
 from open_webui.models.functions import Functions
 from open_webui.models.models import Models
+from open_webui.models.totp import UserTOTPs
 from open_webui.models.users import UserModel, Users
 from open_webui.routers import (
     analytics,
@@ -547,6 +549,9 @@ from open_webui.utils.auth import (
     get_http_authorization_cred,
     get_license_data,
     get_verified_user,
+    is_valid_token,
+    token_meets_mfa_requirements,
+    token_meets_trusted_header_requirements,
 )
 from open_webui.utils.chat import (
     chat_completed as chat_completed_handler,
@@ -589,6 +594,17 @@ if SAFE_MODE:
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
+
+
+async def periodic_totp_challenge_cleanup():
+    while True:
+        try:
+            if not await UserTOTPs.cleanup_challenges():
+                log.warning('Failed to clean up expired TOTP challenges')
+        except Exception as e:
+            log.warning(f'Failed to clean up expired TOTP challenges: {e}')
+
+        await asyncio.sleep(300)
 
 
 class SPAStaticFiles(StaticFiles):
@@ -662,6 +678,7 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(periodic_usage_pool_cleanup())
     asyncio.create_task(periodic_session_pool_cleanup())
+    asyncio.create_task(periodic_totp_challenge_cleanup())
 
     from open_webui.utils.automations import scheduler_worker_loop
 
@@ -863,6 +880,7 @@ app.state.config.ENABLE_PASSWORD_CHANGE_FORM = ENABLE_PASSWORD_CHANGE_FORM
 app.state.config.ENABLE_API_KEYS = ENABLE_API_KEYS
 app.state.config.ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS = ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS
 app.state.config.API_KEYS_ALLOWED_ENDPOINTS = API_KEYS_ALLOWED_ENDPOINTS
+app.state.config.ENABLE_TOTP = ENABLE_TOTP
 
 app.state.config.JWT_EXPIRES_IN = JWT_EXPIRES_IN
 
@@ -2336,8 +2354,26 @@ async def get_app_config(request: Request):
                 detail='Invalid token',
             )
         if data is not None and 'id' in data:
-            user = await Users.get_user_by_id(data['id'])
+            if not await is_valid_token(request, data):
+                user = None
+            else:
+                user = await Users.get_user_by_id(data['id'])
+                if user is not None:
+                    if not token_meets_trusted_header_requirements(data, user, request.headers):
+                        user = None
+                    else:
+                        try:
+                            mfa_allowed = await token_meets_mfa_requirements(
+                                data,
+                                user,
+                                request.app.state.config.ENABLE_TOTP,
+                            )
+                        except Exception:
+                            log.exception('Failed to validate MFA requirements for app config')
+                            mfa_allowed = False
 
+                        if not mfa_allowed:
+                            user = None
     onboarding = False
     if user is None:
         onboarding = not await Users.has_users()
@@ -2365,6 +2401,7 @@ async def get_app_config(request: Request):
                 {
                     'enable_api_keys': app.state.config.ENABLE_API_KEYS,
                     'enable_password_change_form': app.state.config.ENABLE_PASSWORD_CHANGE_FORM,
+                    'enable_totp': app.state.config.ENABLE_TOTP,
                     'enable_version_update_check': ENABLE_VERSION_UPDATE_CHECK,
                     'enable_public_active_users_count': ENABLE_PUBLIC_ACTIVE_USERS_COUNT,
                     'enable_easter_eggs': ENABLE_EASTER_EGGS,

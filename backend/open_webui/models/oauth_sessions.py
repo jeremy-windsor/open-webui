@@ -26,6 +26,7 @@ class OAuthSession(Base):
     id = Column(Text, primary_key=True, unique=True)
     user_id = Column(Text, nullable=False)
     provider = Column(Text, nullable=False)
+    sid = Column(Text, nullable=True)
     token = Column(Text, nullable=False)  # JSON with access_token, id_token, refresh_token
     expires_at = Column(BigInteger, nullable=False)
     created_at = Column(BigInteger, nullable=False)
@@ -36,6 +37,7 @@ class OAuthSession(Base):
         Index('idx_oauth_session_user_id', 'user_id'),
         Index('idx_oauth_session_expires_at', 'expires_at'),
         Index('idx_oauth_session_user_provider', 'user_id', 'provider'),
+        Index('idx_oauth_session_provider_sid', 'provider', 'sid'),
     )
 
 
@@ -43,12 +45,21 @@ class OAuthSessionModel(BaseModel):
     id: str
     user_id: str
     provider: str
+    sid: str | None = None
     token: dict
     expires_at: int  # timestamp in epoch
     created_at: int  # timestamp in epoch
     updated_at: int  # timestamp in epoch
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class OAuthSessionIdentityModel(BaseModel):
+    id: str
+    user_id: str
+    provider: str
+    sid: str | None = None
+    expires_at: int | None = None
 
 
 ####################
@@ -106,6 +117,7 @@ class OAuthSessionTable:
         user_id: str,
         provider: str,
         token: dict,
+        sid: str | None = None,
         db: Optional[AsyncSession] = None,
     ) -> Optional[OAuthSessionModel]:
         """Create a new OAuth session"""
@@ -119,6 +131,7 @@ class OAuthSessionTable:
                         'id': id,
                         'user_id': user_id,
                         'provider': provider,
+                        'sid': sid,
                         'token': self._encrypt_token(token),
                         'expires_at': token.get('expires_at') or int(time.time() + 3600),
                         'created_at': current_time,
@@ -136,6 +149,7 @@ class OAuthSessionTable:
                         id=result.id,
                         user_id=result.user_id,
                         provider=result.provider,
+                        sid=result.sid,
                         token=token,  # Return decrypted token
                         expires_at=result.expires_at,
                         created_at=result.created_at,
@@ -161,6 +175,7 @@ class OAuthSessionTable:
                         id=session.id,
                         user_id=session.user_id,
                         provider=session.provider,
+                        sid=session.sid,
                         token=self._decrypt_token(session.token),
                         expires_at=session.expires_at,
                         created_at=session.created_at,
@@ -185,6 +200,7 @@ class OAuthSessionTable:
                         id=session.id,
                         user_id=session.user_id,
                         provider=session.provider,
+                        sid=session.sid,
                         token=self._decrypt_token(session.token),
                         expires_at=session.expires_at,
                         created_at=session.created_at,
@@ -213,6 +229,7 @@ class OAuthSessionTable:
                         id=session.id,
                         user_id=session.user_id,
                         provider=session.provider,
+                        sid=session.sid,
                         token=self._decrypt_token(session.token),
                         expires_at=session.expires_at,
                         created_at=session.created_at,
@@ -239,6 +256,7 @@ class OAuthSessionTable:
                                 id=session.id,
                                 user_id=session.user_id,
                                 provider=session.provider,
+                                sid=session.sid,
                                 token=self._decrypt_token(session.token),
                                 expires_at=session.expires_at,
                                 created_at=session.created_at,
@@ -247,7 +265,10 @@ class OAuthSessionTable:
                         )
                     except Exception as e:
                         log.warning(
-                            f'Skipping OAuth session {session.id} due to decryption failure, deleting corrupted session: {type(e).__name__}: {e}'
+                            'Skipping OAuth session %s due to decryption failure, deleting corrupted session: %s: %s',
+                            session.id,
+                            type(e).__name__,
+                            e,
                         )
                         await db.execute(delete(OAuthSession).filter_by(id=session.id))
                         await db.commit()
@@ -258,22 +279,126 @@ class OAuthSessionTable:
             log.error(f'Error getting OAuth sessions by user ID: {e}')
             return []
 
+    async def get_sessions_by_provider_and_sid(
+        self, provider: str, sid: str, db: Optional[AsyncSession] = None
+    ) -> List[OAuthSessionModel]:
+        """Get OAuth sessions for an OIDC provider session ID."""
+        try:
+            async with get_async_db_context(db) as db:
+                result = await db.execute(select(OAuthSession).filter_by(provider=provider, sid=sid))
+                sessions = result.scalars().all()
+
+                results = []
+                for session in sessions:
+                    results.append(
+                        OAuthSessionModel(
+                            id=session.id,
+                            user_id=session.user_id,
+                            provider=session.provider,
+                            sid=session.sid,
+                            token=self._decrypt_token(session.token),
+                            expires_at=session.expires_at,
+                            created_at=session.created_at,
+                            updated_at=session.updated_at,
+                        )
+                    )
+                return results
+        except Exception as e:
+            log.error(f'Error getting OAuth sessions by provider {provider} and sid: {e}')
+            raise
+
+    async def get_session_identities_by_provider_and_sid(
+        self, provider: str, sid: str, db: Optional[AsyncSession] = None
+    ) -> List[OAuthSessionIdentityModel]:
+        """Get logout-safe OAuth session identities without decrypting stored tokens."""
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(OAuthSession.id, OAuthSession.user_id, OAuthSession.provider, OAuthSession.sid).filter_by(
+                    provider=provider,
+                    sid=sid,
+                )
+            )
+            return [
+                OAuthSessionIdentityModel(
+                    id=row.id,
+                    user_id=row.user_id,
+                    provider=row.provider,
+                    sid=row.sid,
+                    expires_at=None,
+                )
+                for row in result.all()
+            ]
+
+    async def get_session_identity_by_id(
+        self, session_id: str, db: Optional[AsyncSession] = None
+    ) -> Optional[OAuthSessionIdentityModel]:
+        """Get an OAuth session identity without decrypting stored tokens."""
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(
+                    OAuthSession.id,
+                    OAuthSession.user_id,
+                    OAuthSession.provider,
+                    OAuthSession.sid,
+                    OAuthSession.expires_at,
+                ).filter_by(id=session_id)
+            )
+            row = result.first()
+            if not row:
+                return None
+
+            return OAuthSessionIdentityModel(
+                id=row.id,
+                user_id=row.user_id,
+                provider=row.provider,
+                sid=row.sid,
+                expires_at=row.expires_at,
+            )
+
+    async def get_session_identities_by_user_id(
+        self, user_id: str, db: Optional[AsyncSession] = None
+    ) -> List[OAuthSessionIdentityModel]:
+        """Get logout-safe OAuth session identities for a user without decrypting stored tokens."""
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(OAuthSession.id, OAuthSession.user_id, OAuthSession.provider, OAuthSession.sid).filter_by(
+                    user_id=user_id
+                )
+            )
+            return [
+                OAuthSessionIdentityModel(
+                    id=row.id,
+                    user_id=row.user_id,
+                    provider=row.provider,
+                    sid=row.sid,
+                    expires_at=None,
+                )
+                for row in result.all()
+            ]
+
     async def update_session_by_id(
-        self, session_id: str, token: dict, db: Optional[AsyncSession] = None
+        self,
+        session_id: str,
+        token: dict,
+        sid: str | None = None,
+        db: Optional[AsyncSession] = None,
     ) -> Optional[OAuthSessionModel]:
         """Update OAuth session tokens"""
         try:
             async with get_async_db_context(db) as db:
                 current_time = int(time.time())
+                values = {
+                    'token': self._encrypt_token(token),
+                    'expires_at': token.get('expires_at') or int(time.time() + 3600),
+                    'updated_at': current_time,
+                }
+                if sid is not None:
+                    values['sid'] = sid
 
                 await db.execute(
                     update(OAuthSession)
                     .filter_by(id=session_id)
-                    .values(
-                        token=self._encrypt_token(token),
-                        expires_at=token.get('expires_at') or int(time.time() + 3600),
-                        updated_at=current_time,
-                    )
+                    .values(**values)
                 )
                 await db.commit()
                 result = await db.execute(select(OAuthSession).filter_by(id=session_id))
@@ -284,6 +409,7 @@ class OAuthSessionTable:
                         id=session.id,
                         user_id=session.user_id,
                         provider=session.provider,
+                        sid=session.sid,
                         token=self._decrypt_token(session.token),
                         expires_at=session.expires_at,
                         created_at=session.created_at,
@@ -305,6 +431,16 @@ class OAuthSessionTable:
         except Exception as e:
             log.error(f'Error deleting OAuth session: {e}')
             return False
+
+    async def delete_sessions_by_ids(self, session_ids: list[str], db: Optional[AsyncSession] = None) -> int:
+        """Delete OAuth sessions by IDs, raising on database errors."""
+        if not session_ids:
+            return 0
+
+        async with get_async_db_context(db) as db:
+            result = await db.execute(delete(OAuthSession).where(OAuthSession.id.in_(session_ids)))
+            await db.commit()
+            return result.rowcount or 0
 
     async def delete_sessions_by_user_id(self, user_id: str, db: Optional[AsyncSession] = None) -> bool:
         """Delete all OAuth sessions for a user"""

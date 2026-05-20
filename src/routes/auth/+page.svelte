@@ -106,7 +106,7 @@
 			return;
 		}
 
-		await setSessionUser(sessionUser);
+		await setSessionUser(sessionUser, localStorage.getItem('redirectPath') || null);
 	};
 
 	const signUpHandler = async () => {
@@ -124,7 +124,7 @@
 			}
 		);
 
-		await setSessionUser(sessionUser);
+		await setSessionUser(sessionUser, localStorage.getItem('redirectPath') || null);
 	};
 
 	const ldapSignInHandler = async () => {
@@ -137,7 +137,7 @@
 			return;
 		}
 
-		await setSessionUser(sessionUser);
+		await setSessionUser(sessionUser, localStorage.getItem('redirectPath') || null);
 	};
 
 	const verifyTOTPHandler = async () => {
@@ -146,11 +146,15 @@
 			useBackupCode ? null : mfaCode,
 			useBackupCode ? mfaBackupCode : null
 		).catch((error) => {
-			toast.error(`${error}`);
+			const message = `${error}`;
+			toast.error(message);
+			if (message.toLowerCase().includes('token')) {
+				clearTOTPChallenge();
+			}
 			return null;
 		});
 
-		await setSessionUser(sessionUser);
+		await setSessionUser(sessionUser, localStorage.getItem('redirectPath') || null);
 	};
 
 	const submitHandler = async () => {
@@ -358,9 +362,7 @@
 
 										{#if useBackupCode}
 											<div>
-												<label
-													for="backup-code"
-													class="text-sm font-medium text-left mb-1 block"
+												<label for="backup-code" class="text-sm font-medium text-left mb-1 block"
 													>{$i18n.t('Backup code')}</label
 												>
 												<input

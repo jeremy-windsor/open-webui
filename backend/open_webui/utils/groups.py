@@ -18,7 +18,6 @@ async def apply_default_group_assignment(
         user_id: ID of the user to add to the default group
     """
     if default_group_id:
-        try:
-            await Groups.add_users_to_group(default_group_id, [user_id], db=db)
-        except Exception as e:
-            log.error(f'Failed to add user {user_id} to default group {default_group_id}: {e}')
+        group = await Groups.add_users_to_group(default_group_id, [user_id], db=db)
+        if not group:
+            raise RuntimeError(f'Failed to add user {user_id} to default group {default_group_id}')

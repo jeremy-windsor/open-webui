@@ -10,7 +10,8 @@ import uuid
 from ssl import CERT_NONE, CERT_REQUIRED, PROTOCOL_TLS
 from typing import List, Optional
 
-from aiohttp import ClientSession
+import jwt as pyjwt
+from aiohttp import BasicAuth, ClientSession
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from ldap3 import NONE, Connection, Server, Tls
@@ -52,7 +53,7 @@ from open_webui.models.auths import (
 )
 from open_webui.models.groups import Groups
 from open_webui.models.oauth_sessions import OAuthSessions
-from open_webui.models.totp import UserTOTP, UserTOTPs
+from open_webui.models.totp import UserTOTPs
 from open_webui.models.users import (
     UpdateProfileForm,
     UserModel,
@@ -68,30 +69,52 @@ from open_webui.utils.auth import (
     get_admin_user,
     get_current_user,
     get_http_authorization_cred,
+    get_request_oauth_token_binding_claims,
     get_password_hash,
     get_verified_user,
+    is_valid_decoded_token,
     invalidate_token,
     validate_password,
     verify_password,
 )
+from open_webui.utils.auth_state import update_password_and_revoke_auth_state
+from open_webui.utils.bootstrap import bootstrap_user_creation_lock
 from open_webui.utils.groups import apply_default_group_assignment
 from open_webui.utils.misc import parse_duration, validate_email_format
-from open_webui.utils.oauth import auth_manager_config
+from open_webui.utils.oauth import (
+    _extract_oauth_sid,
+    _get_user_by_email_strict,
+    _get_user_by_oauth_sub_strict,
+    _json_safe_dict,
+    auth_manager_config,
+    get_oauth_session_token_claims,
+    record_oauth_sid_user_mapping,
+    remove_oauth_sid_user_mapping,
+    store_oauth_session,
+)
 from open_webui.utils.rate_limit import RateLimiter
 from open_webui.utils.redis import get_redis_client
+from open_webui.utils.sessions import disconnect_user_live_sessions, disconnect_user_oauth_live_sessions
 from open_webui.utils.totp import (
     build_otpauth_uri,
+    decrypt_totp_data,
     decrypt_totp_secret,
+    encrypt_totp_data,
     encrypt_totp_secret,
     generate_backup_codes,
     generate_totp_secret,
     hash_backup_code,
-    verify_backup_code,
     verify_totp,
 )
+from open_webui.utils.totp_auth import (
+    consume_totp_verification,
+    get_totp_challenge_context_hash,
+    request_uses_api_key_auth,
+    validate_totp_or_backup_code,
+    verify_user_step_up,
+)
 from open_webui.utils.webhook import post_webhook
-from pydantic import BaseModel
-from sqlalchemy import select
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter()
@@ -102,8 +125,49 @@ signin_rate_limiter = RateLimiter(redis_client=get_redis_client(), limit=5 * 3, 
 totp_rate_limiter = RateLimiter(redis_client=get_redis_client(), limit=5, window=60 * 5)
 
 
+async def disconnect_user_sessions_soon(user_id: str, delay_seconds: float = 1.0) -> None:
+    await asyncio.sleep(delay_seconds)
+    await disconnect_user_live_sessions(user_id)
+
+
+async def cleanup_created_user(user_id: str | None, db: AsyncSession | None = None) -> None:
+    if not user_id:
+        return
+
+    try:
+        await Auths.delete_auth_by_id(user_id)
+    except Exception:
+        log.warning('Failed to clean up partially created user %s', user_id, exc_info=True)
+
+
+def get_request_auth_method(request: Request) -> str:
+    token = None
+    auth_header = request.headers.get('Authorization')
+    if auth_header:
+        auth_cred = get_http_authorization_cred(auth_header)
+        if auth_cred is not None:
+            token = auth_cred.credentials
+    if token is None:
+        token = request.cookies.get('token')
+    if token is None and getattr(request.state, 'token', None):
+        token = request.state.token.credentials
+
+    data = decode_token(token) if token else None
+    if data and data.get('auth_method'):
+        return data['auth_method']
+
+    return 'password'
+
+
 async def create_session_response(
-    request: Request, user, db, response: Response = None, set_cookie: bool = False
+    request: Request,
+    user,
+    db,
+    response: Response = None,
+    set_cookie: bool = False,
+    mfa_verified: bool = False,
+    auth_method: str = 'password',
+    extra_token_data: dict | None = None,
 ) -> dict:
     """
     Create JWT token and build session response for a user.
@@ -121,8 +185,29 @@ async def create_session_response(
     if expires_delta:
         expires_at = int(time.time()) + int(expires_delta.total_seconds())
 
+    token_data = {
+        'id': user.id,
+        'auth_method': auth_method,
+        'auth_state_version': user.auth_state_version or 0,
+    }
+    if auth_method in {'oauth', 'oauth_token_exchange'}:
+        token_data.update(get_request_oauth_token_binding_claims(request))
+    if extra_token_data:
+        token_data.update(extra_token_data)
+    user_totp = await UserTOTPs.get_user_totp_by_user_id(user.id, db=db)
+    if user_totp and not (user_totp.secret and not user_totp.enabled):
+        token_data['totp_state_version'] = user_totp.backup_code_version or 0
+
+    if mfa_verified and request.app.state.config.ENABLE_TOTP:
+        if user_totp and user_totp.enabled and user_totp.secret:
+            token_data['mfa'] = {
+                'totp': True,
+                'totp_version': user_totp.backup_code_version or 0,
+                'verified_at': int(time.time()),
+            }
+
     token = create_token(
-        data={'id': user.id},
+        data=token_data,
         expires_delta=expires_delta,
     )
 
@@ -154,9 +239,41 @@ async def create_session_response(
     }
 
 
-def create_totp_challenge_response(user) -> dict:
+async def create_totp_challenge_response(
+    user,
+    db,
+    auth_method: str = 'password',
+    oauth_provider: str | None = None,
+    oauth_subject: str | None = None,
+    oauth_sid: str | None = None,
+    oauth_token: str | None = None,
+) -> dict:
+    challenge = await UserTOTPs.create_challenge_by_user_id(
+        user.id,
+        oauth_provider=oauth_provider,
+        oauth_subject=oauth_subject,
+        oauth_sid=oauth_sid,
+        oauth_token=oauth_token,
+        db=db,
+    )
+    if not challenge:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=ERROR_MESSAGES.RATE_LIMIT_EXCEEDED,
+        )
+
+    user_totp = await UserTOTPs.get_user_totp_by_user_id(user.id, db=db)
+    totp_state_version = user_totp.backup_code_version or 0 if user_totp else 0
     mfa_token = create_token(
-        data={'mfa_user_id': user.id, 'purpose': 'totp_login'},
+        data={
+            'mfa_user_id': user.id,
+            'mfa_challenge_id': challenge.id,
+            'mfa_context_hash': get_totp_challenge_context_hash(challenge),
+            'auth_state_version': user.auth_state_version or 0,
+            'totp_state_version': totp_state_version,
+            'purpose': 'totp_login',
+            'auth_method': auth_method,
+        },
         expires_delta=datetime.timedelta(minutes=5),
     )
     return {
@@ -168,73 +285,102 @@ def create_totp_challenge_response(user) -> dict:
 
 
 async def create_session_or_totp_challenge_response(
-    request: Request, user, db, response: Response = None, set_cookie: bool = False
+    request: Request,
+    user,
+    db,
+    response: Response = None,
+    set_cookie: bool = False,
+    auth_method: str = 'password',
+    extra_token_data: dict | None = None,
 ) -> dict:
-    if await UserTOTPs.is_totp_enabled_by_user_id(user.id, db=db):
-        return create_totp_challenge_response(user)
+    if request.app.state.config.ENABLE_TOTP and await UserTOTPs.is_totp_enabled_by_user_id(user.id, db=db):
+        log_totp_event(request, 'challenge_created', user.id)
+        return await create_totp_challenge_response(user, db, auth_method=auth_method)
 
-    return await create_session_response(request, user, db, response, set_cookie=set_cookie)
+    return await create_session_response(
+        request,
+        user,
+        db,
+        response,
+        set_cookie=set_cookie,
+        auth_method=auth_method,
+        extra_token_data=extra_token_data,
+    )
 
 
-def get_totp_challenge_user_id(mfa_token: str) -> str:
+def ensure_totp_feature_enabled(request: Request) -> None:
+    if not request.app.state.config.ENABLE_TOTP:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ERROR_MESSAGES.ACTION_PROHIBITED,
+        )
+
+
+def log_totp_event(request: Request, event: str, user_id: str, level: int = logging.INFO, **extra) -> None:
+    metadata = {
+        'event': event,
+        'user_id': user_id,
+        'source_ip': request.client.host if request.client else None,
+        **extra,
+    }
+    log.log(level, 'TOTP security event: %s', metadata)
+
+
+async def get_totp_challenge(mfa_token: str, request: Request, db: AsyncSession | None = None):
     data = decode_token(mfa_token)
-    if not data or data.get('purpose') != 'totp_login' or not data.get('mfa_user_id'):
+    if (
+        not data
+        or data.get('purpose') != 'totp_login'
+        or not data.get('mfa_user_id')
+        or not data.get('mfa_challenge_id')
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.INVALID_TOKEN,
         )
-    return data['mfa_user_id']
 
+    if not await is_valid_decoded_token(
+        data,
+        request.app.state.redis,
+        user_id=data['mfa_user_id'],
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.INVALID_TOKEN,
+        )
 
-async def verify_totp_or_backup_code(
-    user_id: str,
-    *,
-    code: str | None = None,
-    backup_code: str | None = None,
-    db: AsyncSession | None = None,
-) -> bool:
-    if bool(code) == bool(backup_code):
-        return False
+    challenge = await UserTOTPs.get_challenge_by_id(data['mfa_challenge_id'], db=db)
+    if not challenge or challenge.user_id != data['mfa_user_id']:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.INVALID_TOKEN,
+        )
 
-    try:
-        async with get_async_db_context(db) as session:
-            result = await session.execute(select(UserTOTP).filter_by(user_id=user_id).with_for_update())
-            user_totp = result.scalars().first()
-            if not user_totp or not user_totp.enabled or not user_totp.secret:
-                return False
+    challenge_user = await Users.get_user_by_id(challenge.user_id, db=db)
+    if not challenge_user or (data.get('auth_state_version') or 0) != (challenge_user.auth_state_version or 0):
+        log_totp_event(request, 'challenge_auth_state_mismatch', challenge.user_id, logging.WARNING)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.INVALID_TOKEN,
+        )
 
-            now = int(time.time())
+    user_totp = await UserTOTPs.get_user_totp_by_user_id(challenge.user_id, db=db)
+    totp_state_version = user_totp.backup_code_version or 0 if user_totp else 0
+    if (data.get('totp_state_version') or 0) != totp_state_version:
+        log_totp_event(request, 'challenge_totp_state_mismatch', challenge.user_id, logging.WARNING)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.INVALID_TOKEN,
+        )
 
-            if backup_code:
-                backup_codes = list(user_totp.backup_codes or [])
-                for index, hashed_code in enumerate(backup_codes):
-                    if verify_backup_code(backup_code, hashed_code):
-                        user_totp.backup_codes = backup_codes[:index] + backup_codes[index + 1 :]
-                        user_totp.last_used_at = now
-                        user_totp.updated_at = now
-                        await session.commit()
-                        return True
+    if data.get('mfa_context_hash') != get_totp_challenge_context_hash(challenge):
+        log_totp_event(request, 'challenge_context_mismatch', challenge.user_id, logging.WARNING)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.INVALID_TOKEN,
+        )
 
-                return False
-
-            try:
-                secret = decrypt_totp_secret(user_totp.secret)
-            except Exception:
-                log.exception('Failed to decrypt TOTP secret')
-                return False
-
-            used_step = verify_totp(secret, code, last_used_step=user_totp.last_used_step)
-            if used_step is None:
-                return False
-
-            user_totp.last_used_at = now
-            user_totp.last_used_step = used_step
-            user_totp.updated_at = now
-            await session.commit()
-            return True
-    except Exception:
-        log.exception('Failed to verify TOTP or backup code')
-        return False
+    return challenge, data.get('auth_method') or 'password'
 
 
 ############################
@@ -265,6 +411,9 @@ class TOTPStatusResponse(BaseModel):
     created_at: int | None = None
     last_used_at: int | None = None
     backup_codes_remaining: int = 0
+    token: str | None = None
+    token_type: str | None = None
+    expires_at: int | None = None
 
 
 class TOTPSetupResponse(BaseModel):
@@ -272,21 +421,29 @@ class TOTPSetupResponse(BaseModel):
     otpauth_url: str
 
 
+class TOTPSetupForm(BaseModel):
+    password: str | None = Field(default=None, max_length=1024)
+
+
 class TOTPEnableForm(BaseModel):
-    code: str
+    password: str | None = Field(default=None, max_length=1024)
+    code: str = Field(min_length=1, max_length=32)
 
 
 class TOTPCodeForm(BaseModel):
-    code: str | None = None
-    backup_code: str | None = None
+    code: str | None = Field(default=None, max_length=32)
+    backup_code: str | None = Field(default=None, max_length=64)
 
 
 class TOTPLoginForm(TOTPCodeForm):
-    mfa_token: str
+    mfa_token: str = Field(min_length=1, max_length=4096)
 
 
 class TOTPBackupCodesResponse(TOTPStatusResponse):
     backup_codes: list[str]
+    token: str | None = None
+    token_type: str | None = None
+    expires_at: int | None = None
 
 
 def get_totp_status_response(user_totp) -> TOTPStatusResponse:
@@ -373,9 +530,11 @@ async def get_session_user(
 
 @router.get('/totp', response_model=TOTPStatusResponse)
 async def get_totp_status(
+    request: Request,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    ensure_totp_feature_enabled(request)
     user_totp = await UserTOTPs.get_user_totp_by_user_id(user.id, db=db)
     return get_totp_status_response(user_totp)
 
@@ -383,12 +542,27 @@ async def get_totp_status(
 @router.post('/totp/setup', response_model=TOTPSetupResponse)
 async def setup_totp(
     request: Request,
+    form_data: TOTPSetupForm,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    ensure_totp_feature_enabled(request)
+    if request_uses_api_key_auth(request):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+
+    if totp_rate_limiter.is_limited(f'setup:{user.id}'):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=ERROR_MESSAGES.RATE_LIMIT_EXCEEDED,
+        )
+
     existing_totp = await UserTOTPs.get_user_totp_by_user_id(user.id, db=db)
     if existing_totp and existing_totp.enabled:
         raise HTTPException(400, detail='TOTP is already enabled.')
+
+    if not await verify_user_step_up(user, password=form_data.password, request=request, db=db):
+        log_totp_event(request, 'setup_step_up_failed', user.id, logging.WARNING)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.INVALID_CRED)
 
     secret = generate_totp_secret()
     encrypted_secret = encrypt_totp_secret(secret)
@@ -396,6 +570,7 @@ async def setup_totp(
     if not user_totp:
         raise HTTPException(500, detail='Failed to start TOTP setup.')
 
+    log_totp_event(request, 'setup_started', user.id)
     issuer = request.app.state.WEBUI_NAME or 'Open WebUI'
     return {
         'secret': secret,
@@ -405,10 +580,16 @@ async def setup_totp(
 
 @router.post('/totp/enable', response_model=TOTPBackupCodesResponse)
 async def enable_totp(
+    request: Request,
+    response: Response,
     form_data: TOTPEnableForm,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    ensure_totp_feature_enabled(request)
+    if request_uses_api_key_auth(request):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+
     if totp_rate_limiter.is_limited(f'enable:{user.id}'):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -421,6 +602,10 @@ async def enable_totp(
     if user_totp.enabled:
         raise HTTPException(400, detail='TOTP is already enabled.')
 
+    if not await verify_user_step_up(user, password=form_data.password, request=request, db=db):
+        log_totp_event(request, 'enable_step_up_failed', user.id, logging.WARNING)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.INVALID_CRED)
+
     try:
         secret = decrypt_totp_secret(user_totp.secret)
     except Exception:
@@ -429,6 +614,7 @@ async def enable_totp(
 
     used_step = verify_totp(secret, form_data.code)
     if used_step is None:
+        log_totp_event(request, 'enable_failed', user.id, logging.WARNING, reason='invalid_code')
         raise HTTPException(400, detail='Invalid TOTP code.')
 
     backup_codes = generate_backup_codes()
@@ -437,10 +623,24 @@ async def enable_totp(
     if not user_totp:
         raise HTTPException(500, detail='Failed to enable TOTP.')
 
+    log_totp_event(request, 'enabled', user.id)
+    session_response = await create_session_response(
+        request,
+        user,
+        db,
+        response,
+        set_cookie=True,
+        mfa_verified=True,
+        auth_method=get_request_auth_method(request),
+    )
+    asyncio.create_task(disconnect_user_sessions_soon(user.id))
     status_response = get_totp_status_response(user_totp).model_dump()
     return {
         **status_response,
         'backup_codes': backup_codes,
+        'token': session_response['token'],
+        'token_type': session_response['token_type'],
+        'expires_at': session_response['expires_at'],
     }
 
 
@@ -451,7 +651,9 @@ async def verify_totp_login(
     form_data: TOTPLoginForm,
     db: AsyncSession = Depends(get_async_session),
 ):
-    user_id = get_totp_challenge_user_id(form_data.mfa_token)
+    ensure_totp_feature_enabled(request)
+    challenge, auth_method = await get_totp_challenge(form_data.mfa_token, request=request, db=db)
+    user_id = challenge.user_id
     if totp_rate_limiter.is_limited(f'login:{user_id}'):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -462,24 +664,167 @@ async def verify_totp_login(
     if not user:
         raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
-    verified = await verify_totp_or_backup_code(
+    oauth_challenge = bool(challenge.oauth_provider and challenge.oauth_token)
+    verification = await validate_totp_or_backup_code(
         user.id,
         code=form_data.code,
         backup_code=form_data.backup_code,
         db=db,
     )
+    verified = bool(verification)
     if not verified:
+        challenge_still_active = await UserTOTPs.record_challenge_failed_attempt_by_id(challenge.id, db=db)
+        if not challenge_still_active:
+            log_totp_event(request, 'challenge_locked', user.id, logging.WARNING)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.INVALID_TOKEN,
+            )
+
+        log_totp_event(request, 'login_failed', user.id, logging.WARNING)
         raise HTTPException(400, detail='Invalid TOTP or backup code.')
 
-    return await create_session_response(request, user, db, response, set_cookie=True)
+    used_backup_code = verification.get('method') == 'backup_code'
+    extra_token_data = {}
+
+    if not await UserTOTPs.consume_challenge_by_id(challenge.id, db=db):
+        log_totp_event(request, 'challenge_replay_rejected', user.id, logging.WARNING)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.INVALID_TOKEN,
+        )
+
+    factor_consumed = False
+    if oauth_challenge:
+        try:
+            oauth_payload = decrypt_totp_data(challenge.oauth_token)
+            if not await consume_totp_verification(user.id, verification, db=db):
+                log_totp_event(request, 'factor_replay_rejected', user.id, logging.WARNING)
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=ERROR_MESSAGES.INVALID_TOKEN,
+                )
+            factor_consumed = True
+
+            if oauth_payload.get('token_exchange'):
+                if oauth_payload.get('user_data'):
+                    user = await request.app.state.oauth_manager._sync_oauth_managed_access(
+                        request,
+                        challenge.oauth_provider,
+                        user,
+                        oauth_payload['user_data'],
+                        db=db,
+                    )
+                if not await Users.update_user_oauth_by_id(
+                    user.id,
+                    challenge.oauth_provider,
+                    oauth_payload['sub'],
+                    db=db,
+                ):
+                    raise HTTPException(500, detail='Failed to link OAuth account.')
+                oauth_token = {
+                    **(oauth_payload.get('token') or {}),
+                    'sub': oauth_payload['sub'],
+                    'sid': oauth_payload.get('sid'),
+                }
+                oauth_session = await store_oauth_session(
+                    user.id,
+                    challenge.oauth_provider,
+                    oauth_token,
+                    sid=oauth_payload.get('sid'),
+                    db=db,
+                    redis_client=request.app.state.redis,
+                )
+                if not oauth_session:
+                    raise HTTPException(500, detail='Failed to store OAuth session.')
+                if oauth_payload.get('sid'):
+                    await record_oauth_sid_user_mapping(
+                        request.app.state.redis,
+                        challenge.oauth_provider,
+                        oauth_payload['sid'],
+                        user.id,
+                        oauth_token,
+                    )
+                extra_token_data = get_oauth_session_token_claims(challenge.oauth_provider, oauth_session)
+            elif oauth_payload.get('user_data') and oauth_payload.get('sub') and oauth_payload.get('email'):
+                oauth_token = oauth_payload['token']
+                user = await request.app.state.oauth_manager._apply_oauth_login_updates(
+                    request,
+                    challenge.oauth_provider,
+                    user,
+                    oauth_payload['user_data'],
+                    oauth_token,
+                    oauth_payload['sub'],
+                    oauth_payload['email'],
+                    db=db,
+                )
+            else:
+                oauth_token = oauth_payload
+
+            if not oauth_payload.get('token_exchange'):
+                expires_delta = parse_duration(request.app.state.config.JWT_EXPIRES_IN)
+                cookie_max_age = int(expires_delta.total_seconds()) if expires_delta else None
+                try:
+                    oauth_session = await request.app.state.oauth_manager._set_oauth_session_cookies(
+                        response,
+                        user.id,
+                        challenge.oauth_provider,
+                        oauth_token,
+                        cookie_max_age,
+                        db=db,
+                        redis_client=request.app.state.redis,
+                    )
+                    extra_token_data = get_oauth_session_token_claims(challenge.oauth_provider, oauth_session)
+                except HTTPException:
+                    raise
+                except Exception:
+                    log.warning('Failed to finalize OAuth session cookies after TOTP verification', exc_info=True)
+        except HTTPException:
+            if used_backup_code and factor_consumed:
+                await disconnect_user_live_sessions(user.id)
+            raise
+        except Exception:
+            if used_backup_code and factor_consumed:
+                await disconnect_user_live_sessions(user.id)
+            log.exception('Failed to finalize OAuth session after TOTP verification')
+            raise HTTPException(500, detail='Failed to finalize OAuth session.')
+    elif not await consume_totp_verification(user.id, verification, db=db):
+        log_totp_event(request, 'factor_replay_rejected', user.id, logging.WARNING)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.INVALID_TOKEN,
+        )
+    else:
+        factor_consumed = True
+
+    if used_backup_code and factor_consumed:
+        await disconnect_user_live_sessions(user.id)
+
+    log_totp_event(request, 'login_succeeded', user.id, method='backup_code' if form_data.backup_code else 'totp')
+    return await create_session_response(
+        request,
+        user,
+        db,
+        response,
+        set_cookie=True,
+        mfa_verified=True,
+        auth_method=auth_method,
+        extra_token_data=extra_token_data,
+    )
 
 
 @router.post('/totp/disable', response_model=TOTPStatusResponse)
 async def disable_totp(
+    request: Request,
+    response: Response,
     form_data: TOTPCodeForm,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    ensure_totp_feature_enabled(request)
+    if request_uses_api_key_auth(request):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+
     if totp_rate_limiter.is_limited(f'disable:{user.id}'):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -489,27 +834,63 @@ async def disable_totp(
     if not await UserTOTPs.is_totp_enabled_by_user_id(user.id, db=db):
         return TOTPStatusResponse(enabled=False)
 
-    verified = await verify_totp_or_backup_code(
+    verification = await validate_totp_or_backup_code(
         user.id,
         code=form_data.code,
         backup_code=form_data.backup_code,
         db=db,
     )
-    if not verified:
+    if not verification:
+        log_totp_event(request, 'disable_failed', user.id, logging.WARNING)
         raise HTTPException(400, detail='Invalid TOTP or backup code.')
 
-    if not await UserTOTPs.disable_totp_by_user_id(user.id, db=db):
-        raise HTTPException(500, detail='Failed to disable TOTP.')
+    used_backup_code = verification.get('method') == 'backup_code'
+    factor_consumed = False
+    try:
+        if not await consume_totp_verification(user.id, verification, db=db):
+            log_totp_event(request, 'factor_replay_rejected', user.id, logging.WARNING)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.INVALID_TOKEN,
+            )
+        factor_consumed = True
 
-    return TOTPStatusResponse(enabled=False)
+        if not await UserTOTPs.disable_totp_by_user_id(user.id, db=db):
+            raise HTTPException(500, detail='Failed to disable TOTP.')
+
+        log_totp_event(request, 'disabled', user.id)
+        session_response = await create_session_response(
+            request,
+            user,
+            db,
+            response,
+            set_cookie=True,
+            auth_method=get_request_auth_method(request),
+        )
+        asyncio.create_task(disconnect_user_sessions_soon(user.id))
+        return TOTPStatusResponse(
+            enabled=False,
+            token=session_response['token'],
+            token_type=session_response['token_type'],
+            expires_at=session_response['expires_at'],
+        )
+    finally:
+        if used_backup_code and factor_consumed:
+            await disconnect_user_live_sessions(user.id)
 
 
 @router.post('/totp/backup-codes/regenerate', response_model=TOTPBackupCodesResponse)
 async def regenerate_totp_backup_codes(
+    request: Request,
+    response: Response,
     form_data: TOTPCodeForm,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    ensure_totp_feature_enabled(request)
+    if request_uses_api_key_auth(request):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+
     if totp_rate_limiter.is_limited(f'backup:{user.id}'):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -519,26 +900,55 @@ async def regenerate_totp_backup_codes(
     if not await UserTOTPs.is_totp_enabled_by_user_id(user.id, db=db):
         raise HTTPException(400, detail='TOTP is not enabled.')
 
-    verified = await verify_totp_or_backup_code(
+    verification = await validate_totp_or_backup_code(
         user.id,
         code=form_data.code,
         backup_code=form_data.backup_code,
         db=db,
     )
-    if not verified:
+    if not verification:
+        log_totp_event(request, 'backup_codes_regenerate_failed', user.id, logging.WARNING)
         raise HTTPException(400, detail='Invalid TOTP or backup code.')
 
-    backup_codes = generate_backup_codes()
-    hashed_backup_codes = [hash_backup_code(code) for code in backup_codes]
-    user_totp = await UserTOTPs.replace_backup_codes_by_user_id(user.id, hashed_backup_codes, db=db)
-    if not user_totp:
-        raise HTTPException(500, detail='Failed to regenerate backup codes.')
+    used_backup_code = verification.get('method') == 'backup_code'
+    factor_consumed = False
+    try:
+        if not await consume_totp_verification(user.id, verification, db=db):
+            log_totp_event(request, 'factor_replay_rejected', user.id, logging.WARNING)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.INVALID_TOKEN,
+            )
+        factor_consumed = True
 
-    status_response = get_totp_status_response(user_totp).model_dump()
-    return {
-        **status_response,
-        'backup_codes': backup_codes,
-    }
+        backup_codes = generate_backup_codes()
+        hashed_backup_codes = [hash_backup_code(code) for code in backup_codes]
+        user_totp = await UserTOTPs.replace_backup_codes_by_user_id(user.id, hashed_backup_codes, db=db)
+        if not user_totp:
+            raise HTTPException(500, detail='Failed to regenerate backup codes.')
+
+        log_totp_event(request, 'backup_codes_regenerated', user.id)
+        session_response = await create_session_response(
+            request,
+            user,
+            db,
+            response,
+            set_cookie=True,
+            mfa_verified=True,
+            auth_method=get_request_auth_method(request),
+        )
+        asyncio.create_task(disconnect_user_sessions_soon(user.id))
+        status_response = get_totp_status_response(user_totp).model_dump()
+        return {
+            **status_response,
+            'backup_codes': backup_codes,
+            'token': session_response['token'],
+            'token_type': session_response['token_type'],
+            'expires_at': session_response['expires_at'],
+        }
+    finally:
+        if used_backup_code and factor_consumed:
+            await disconnect_user_live_sessions(user.id)
 
 
 ############################
@@ -599,6 +1009,7 @@ async def update_timezone(
 
 @router.post('/update/password', response_model=bool)
 async def update_password(
+    request: Request,
     form_data: UpdatePasswordForm,
     session_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_async_session),
@@ -619,7 +1030,10 @@ async def update_password(
             except Exception as e:
                 raise HTTPException(400, detail=str(e))
             hashed = get_password_hash(form_data.new_password)
-            return await Auths.update_user_password_by_id(user.id, hashed, db=db)
+            updated = await update_password_and_revoke_auth_state(request, user.id, hashed, db=db)
+            if not updated:
+                raise HTTPException(500, detail='Failed to update password.')
+            return updated
         else:
             raise HTTPException(400, detail=ERROR_MESSAGES.INCORRECT_PASSWORD)
     else:
@@ -810,24 +1224,31 @@ async def ldap_auth(
 
             user = await Users.get_user_by_email(email, db=db)
             if not user:
+                created_user_id = None
                 try:
-                    # Insert with default role first to avoid TOCTOU race on
-                    # first-user registration.  Matches signup_handler pattern.
-                    user = await Auths.insert_new_auth(
-                        email=email,
-                        password=str(uuid.uuid4()),
-                        name=cn,
-                        role=request.app.state.config.DEFAULT_USER_ROLE,
-                        db=db,
-                    )
+                    promoted_first_user = False
+                    async with bootstrap_user_creation_lock(db):
+                        user = await Auths.insert_new_auth(
+                            email=email,
+                            password=str(uuid.uuid4()),
+                            name=cn,
+                            role=request.app.state.config.DEFAULT_USER_ROLE,
+                            db=db,
+                            commit=False,
+                        )
 
-                    if not user:
-                        raise HTTPException(500, detail=ERROR_MESSAGES.CREATE_USER_ERROR)
+                        if not user:
+                            raise HTTPException(500, detail=ERROR_MESSAGES.CREATE_USER_ERROR)
+                        created_user_id = user.id
 
-                    # Atomically check if this is the only user *after* the
-                    # insert.  Only the single user present should become admin.
-                    if await Users.get_num_users(db=db) == 1:
-                        await Users.update_user_role_by_id(user.id, 'admin', db=db)
+                        if await Users.get_num_users(db=db) == 1:
+                            if not await Users.update_user_role_by_id(user.id, 'admin', db=db, commit=False):
+                                raise HTTPException(500, detail='Failed to promote first user to admin.')
+                            promoted_first_user = True
+
+                        await db.commit()
+
+                    if promoted_first_user:
                         user = await Users.get_user_by_id(user.id, db=db)
 
                     await apply_default_group_assignment(
@@ -849,24 +1270,36 @@ async def ldap_auth(
                         )
 
                 except HTTPException:
+                    await cleanup_created_user(created_user_id, db=db)
                     raise
                 except Exception as err:
+                    await cleanup_created_user(created_user_id, db=db)
                     log.error(f'LDAP user creation error: {str(err)}')
                     raise HTTPException(500, detail='Internal error occurred during LDAP user creation.')
 
             user = await Auths.authenticate_user_by_email(email, db=db)
 
             if user:
-                if ENABLE_LDAP_GROUP_MANAGEMENT and user_groups:
-                    if ENABLE_LDAP_GROUP_CREATION:
+                if ENABLE_LDAP_GROUP_MANAGEMENT:
+                    if ENABLE_LDAP_GROUP_CREATION and user_groups:
                         await Groups.create_groups_by_group_names(user.id, user_groups, db=db)
                     try:
-                        await Groups.sync_groups_by_group_names(user.id, user_groups, db=db)
+                        if not await Groups.sync_groups_by_group_names(user.id, user_groups or [], db=db):
+                            raise RuntimeError('LDAP group sync failed')
+                        await disconnect_user_live_sessions(user.id)
                         log.info(f'Successfully synced groups for user {user.id}: {user_groups}')
                     except Exception as e:
                         log.error(f'Failed to sync groups for user {user.id}: {e}')
+                        raise HTTPException(500, detail='Failed to synchronize LDAP groups.')
 
-                return await create_session_or_totp_challenge_response(request, user, db, response, set_cookie=True)
+                return await create_session_or_totp_challenge_response(
+                    request,
+                    user,
+                    db,
+                    response,
+                    set_cookie=True,
+                    auth_method='ldap',
+                )
             else:
                 raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
         else:
@@ -888,6 +1321,7 @@ async def signin(
     form_data: SigninForm,
     db: AsyncSession = Depends(get_async_session),
 ):
+    auth_method = 'password'
     if not ENABLE_PASSWORD_AUTH:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -895,6 +1329,7 @@ async def signin(
         )
 
     if WEBUI_AUTH_TRUSTED_EMAIL_HEADER:
+        auth_method = 'trusted_header'
         if WEBUI_AUTH_TRUSTED_EMAIL_HEADER not in request.headers:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.INVALID_TRUSTED_HEADER)
 
@@ -923,14 +1358,18 @@ async def signin(
                 group_names = request.headers.get(WEBUI_AUTH_TRUSTED_GROUPS_HEADER, '').split(',')
                 group_names = [name.strip() for name in group_names if name.strip()]
 
-                if group_names:
-                    await Groups.sync_groups_by_group_names(user.id, group_names, db=db)
+                if not await Groups.sync_groups_by_group_names(user.id, group_names, db=db):
+                    raise HTTPException(500, detail='Failed to synchronize trusted-header groups.')
+                await disconnect_user_live_sessions(user.id)
 
             if WEBUI_AUTH_TRUSTED_ROLE_HEADER:
                 trusted_role = request.headers.get(WEBUI_AUTH_TRUSTED_ROLE_HEADER, '').lower().strip()
                 if trusted_role in {'admin', 'user', 'pending'}:
                     if user.role != trusted_role:
-                        await Users.update_user_role_by_id(user.id, trusted_role, db=db)
+                        if not await Users.update_user_role_by_id(user.id, trusted_role, db=db):
+                            raise HTTPException(500, detail='Failed to update trusted-header role.')
+                        await disconnect_user_live_sessions(user.id)
+                        user.role = trusted_role
                 elif trusted_role:
                     log.warning(f'Ignoring invalid trusted role header value: {trusted_role}')
 
@@ -984,7 +1423,14 @@ async def signin(
         )
 
     if user:
-        return await create_session_or_totp_challenge_response(request, user, db, response, set_cookie=True)
+        return await create_session_or_totp_challenge_response(
+            request,
+            user,
+            db,
+            response,
+            set_cookie=True,
+            auth_method=auth_method,
+        )
     else:
         raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
@@ -1002,6 +1448,7 @@ async def signup_handler(
     profile_image_url: str = '/user.png',
     *,
     db: AsyncSession,
+    enforce_public_signup_policy: bool = False,
 ) -> UserModel:
     """
     Core user-creation logic shared by the signup endpoint and
@@ -1015,41 +1462,69 @@ async def signup_handler(
     # first-user registration can all see an empty table and each get admin.
     hashed = get_password_hash(password)
 
-    user = await Auths.insert_new_auth(
-        email=email.lower(),
-        password=hashed,
-        name=name,
-        profile_image_url=profile_image_url,
-        role=request.app.state.config.DEFAULT_USER_ROLE,
-        db=db,
-    )
-    if not user:
-        raise HTTPException(500, detail=ERROR_MESSAGES.CREATE_USER_ERROR)
+    signup_enabled_before = request.app.state.config.ENABLE_SIGNUP
+    promoted_first_user = False
+    user = None
+    try:
+        async with bootstrap_user_creation_lock(db):
+            users_count = await Users.get_num_users(db=db) or 0
+            if enforce_public_signup_policy:
+                if WEBUI_AUTH:
+                    if not request.app.state.config.ENABLE_SIGNUP or not request.app.state.config.ENABLE_LOGIN_FORM:
+                        if users_count > 0 or not ENABLE_INITIAL_ADMIN_SIGNUP:
+                            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+                elif users_count > 0:
+                    raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
 
-    # Atomically check if this is the only user *after* the insert.
-    # Only the single user present at this point should become admin.
-    if await Users.get_num_users(db=db) == 1:
-        await Users.update_user_role_by_id(user.id, 'admin', db=db)
-        user = await Users.get_user_by_id(user.id, db=db)
-        request.app.state.config.ENABLE_SIGNUP = False
+            if await Users.get_user_by_email(email.lower(), db=db):
+                raise HTTPException(400, detail=ERROR_MESSAGES.EMAIL_TAKEN)
 
-    if request.app.state.config.WEBHOOK_URL:
-        await post_webhook(
-            request.app.state.WEBUI_NAME,
-            request.app.state.config.WEBHOOK_URL,
-            WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
-            {
-                'action': 'signup',
-                'message': WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
-                'user': user.model_dump_json(exclude_none=True),
-            },
+            user = await Auths.insert_new_auth(
+                email=email.lower(),
+                password=hashed,
+                name=name,
+                profile_image_url=profile_image_url,
+                role=request.app.state.config.DEFAULT_USER_ROLE,
+                db=db,
+                commit=False,
+            )
+            if not user:
+                raise HTTPException(500, detail=ERROR_MESSAGES.CREATE_USER_ERROR)
+
+            # Check under the bootstrap lock so concurrent first signups cannot
+            # leave the instance with no admin.
+            if users_count == 0 and await Users.get_num_users(db=db) == 1:
+                if not await Users.update_user_role_by_id(user.id, 'admin', db=db, commit=False):
+                    raise HTTPException(500, detail='Failed to promote first user to admin.')
+                promoted_first_user = True
+
+            await db.commit()
+
+        if promoted_first_user:
+            user = await Users.get_user_by_id(user.id, db=db)
+            request.app.state.config.ENABLE_SIGNUP = False
+
+        if request.app.state.config.WEBHOOK_URL:
+            await post_webhook(
+                request.app.state.WEBUI_NAME,
+                request.app.state.config.WEBHOOK_URL,
+                WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                {
+                    'action': 'signup',
+                    'message': WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                    'user': user.model_dump_json(exclude_none=True),
+                },
+            )
+
+        await apply_default_group_assignment(
+            request.app.state.config.DEFAULT_GROUP_ID,
+            user.id,
+            db=db,
         )
-
-    await apply_default_group_assignment(
-        request.app.state.config.DEFAULT_GROUP_ID,
-        user.id,
-        db=db,
-    )
+    except Exception:
+        request.app.state.config.ENABLE_SIGNUP = signup_enabled_before
+        await cleanup_created_user(user.id if user else None, db=db)
+        raise
 
     return user
 
@@ -1090,6 +1565,7 @@ async def signup(
             form_data.name,
             form_data.profile_image_url,
             db=db,
+            enforce_public_signup_policy=True,
         )
         return await create_session_response(request, user, db, response, set_cookie=True)
     except HTTPException:
@@ -1112,6 +1588,9 @@ async def signout(request: Request, response: Response, db: AsyncSession = Depen
         token = request.cookies.get('token')
 
     if token:
+        decoded = decode_token(token)
+        if decoded and decoded.get('id'):
+            await UserTOTPs.delete_challenges_by_user_id(decoded['id'], db=db)
         await invalidate_token(request, token)
 
     response.delete_cookie('token')
@@ -1123,6 +1602,27 @@ async def signout(request: Request, response: Response, db: AsyncSession = Depen
         response.delete_cookie('oauth_session_id')
 
         session = await OAuthSessions.get_session_by_id(oauth_session_id, db=db)
+        session_provider = session.provider if session else None
+        session_sid = session.sid if session else None
+        session_user_id = session.user_id if session else None
+        oauth_id_token = session.token.get('id_token') if session else None
+
+        if session:
+            if not await OAuthSessions.delete_session_by_id(session.id, db=db):
+                raise HTTPException(
+                    status_code=500,
+                    detail='Failed to delete OAuth session.',
+                    headers=response.headers,
+                )
+            try:
+                await remove_oauth_sid_user_mapping(
+                    request.app.state.redis,
+                    session_provider,
+                    session_sid,
+                    session_user_id,
+                )
+            except Exception:
+                log.warning('Failed to delete OAuth sid mapping for provider %s', session_provider, exc_info=True)
 
         # If a custom end_session_endpoint is configured (e.g. AWS Cognito), redirect
         # there directly instead of attempting OIDC discovery.
@@ -1137,14 +1637,13 @@ async def signout(request: Request, response: Response, db: AsyncSession = Depen
             )
 
         oauth_server_metadata_url = (
-            request.app.state.oauth_manager.get_server_metadata_url(session.provider) if session else None
+            request.app.state.oauth_manager.get_server_metadata_url(session_provider) if session_provider else None
         ) or OPENID_PROVIDER_URL.value
 
-        if session and oauth_server_metadata_url:
-            oauth_id_token = session.token.get('id_token')
+        if oauth_id_token and oauth_server_metadata_url:
             try:
-                async with ClientSession(trust_env=True) as session:
-                    async with session.get(oauth_server_metadata_url, ssl=AIOHTTP_CLIENT_SESSION_SSL) as r:
+                async with ClientSession(trust_env=True) as client_session:
+                    async with client_session.get(oauth_server_metadata_url, ssl=AIOHTTP_CLIENT_SESSION_SSL) as r:
                         if r.status == 200:
                             openid_data = await r.json()
                             logout_url = openid_data.get('end_session_endpoint')
@@ -1194,6 +1693,7 @@ async def signout(request: Request, response: Response, db: AsyncSession = Depen
 
 @router.delete('/oauth/sessions/{provider:path}', response_model=bool)
 async def delete_oauth_session_by_provider(
+    request: Request,
     provider: str,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
@@ -1203,12 +1703,23 @@ async def delete_oauth_session_by_provider(
     The provider string matches the 'provider' field in the oauth_session table
     (e.g. 'mcp:server-id' for MCP connections).
     """
+    sessions = await OAuthSessions.get_sessions_by_user_id(user.id, db=db)
+    provider_sessions = [session for session in sessions if session.provider == provider]
+    provider_sids = {session.sid for session in provider_sessions if session.sid}
+    provider_session_ids = {session.id for session in provider_sessions}
+
     result = await OAuthSessions.delete_sessions_by_user_id_and_provider(user.id, provider, db=db)
     if not result:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='No OAuth session found for this provider',
         )
+    for sid in provider_sids:
+        try:
+            await remove_oauth_sid_user_mapping(request.app.state.redis, provider, sid, user.id)
+        except Exception:
+            log.warning('Failed to delete OAuth sid mapping for provider %s', provider, exc_info=True)
+    await disconnect_user_oauth_live_sessions(user.id, provider, session_ids=provider_session_ids)
     return True
 
 
@@ -1237,6 +1748,7 @@ async def add_user(
             raise HTTPException(400, detail=str(e))
 
         hashed = get_password_hash(form_data.password)
+        created_user_id = None
         user = await Auths.insert_new_auth(
             form_data.email.lower(),
             hashed,
@@ -1247,14 +1759,26 @@ async def add_user(
         )
 
         if user:
-            await apply_default_group_assignment(
-                request.app.state.config.DEFAULT_GROUP_ID,
-                user.id,
-                db=db,
-            )
+            created_user_id = user.id
+            try:
+                await apply_default_group_assignment(
+                    request.app.state.config.DEFAULT_GROUP_ID,
+                    user.id,
+                    db=db,
+                )
+            except Exception:
+                await cleanup_created_user(created_user_id, db=db)
+                raise
 
             expires_delta = parse_duration(request.app.state.config.JWT_EXPIRES_IN)
-            token = create_token(data={'id': user.id}, expires_delta=expires_delta)
+            token = create_token(
+                data={
+                    'id': user.id,
+                    'auth_method': 'password',
+                    'auth_state_version': user.auth_state_version or 0,
+                },
+                expires_delta=expires_delta,
+            )
             return {
                 'token': token,
                 'token_type': 'Bearer',
@@ -1321,6 +1845,7 @@ async def get_admin_config(request: Request, user=Depends(get_admin_user)):
         'ENABLE_API_KEYS': request.app.state.config.ENABLE_API_KEYS,
         'ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS': request.app.state.config.ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS,
         'API_KEYS_ALLOWED_ENDPOINTS': request.app.state.config.API_KEYS_ALLOWED_ENDPOINTS,
+        'ENABLE_TOTP': request.app.state.config.ENABLE_TOTP,
         'DEFAULT_USER_ROLE': request.app.state.config.DEFAULT_USER_ROLE,
         'DEFAULT_GROUP_ID': request.app.state.config.DEFAULT_GROUP_ID,
         'JWT_EXPIRES_IN': request.app.state.config.JWT_EXPIRES_IN,
@@ -1351,6 +1876,7 @@ class AdminConfig(BaseModel):
     ENABLE_API_KEYS: bool
     ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS: bool
     API_KEYS_ALLOWED_ENDPOINTS: str
+    ENABLE_TOTP: bool
     DEFAULT_USER_ROLE: str
     DEFAULT_GROUP_ID: str
     JWT_EXPIRES_IN: str
@@ -1370,10 +1896,70 @@ class AdminConfig(BaseModel):
     PENDING_USER_OVERLAY_TITLE: str | None = None
     PENDING_USER_OVERLAY_CONTENT: str | None = None
     RESPONSE_WATERMARK: str | None = None
+    totp_step_up_password: str | None = Field(default=None, max_length=1024)
+    totp_step_up_code: str | None = Field(default=None, max_length=32)
+    totp_step_up_backup_code: str | None = Field(default=None, max_length=64)
 
 
 @router.post('/admin/config')
-async def update_admin_config(request: Request, form_data: AdminConfig, user=Depends(get_admin_user)):
+async def update_admin_config(
+    request: Request,
+    response: Response,
+    form_data: AdminConfig,
+    user=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    if request_uses_api_key_auth(request):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+
+    totp_config_changed = form_data.ENABLE_TOTP != request.app.state.config.ENABLE_TOTP
+    if totp_config_changed:
+        source_ip = request.client.host if request.client else 'unknown'
+        if totp_rate_limiter.is_limited(f'admin-config:{user.id}:{source_ip}'):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=ERROR_MESSAGES.RATE_LIMIT_EXCEEDED,
+            )
+
+        if not form_data.ENABLE_TOTP:
+            primary_admin = await Users.get_first_user(db=db)
+            if primary_admin and user.id != primary_admin.id:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+
+        step_up_verified = False
+        if await UserTOTPs.is_totp_enabled_by_user_id(user.id, db=db):
+            verification = await validate_totp_or_backup_code(
+                user.id,
+                code=form_data.totp_step_up_code,
+                backup_code=form_data.totp_step_up_backup_code,
+                db=db,
+            )
+            if verification and await consume_totp_verification(user.id, verification, db=db):
+                step_up_verified = True
+                if verification.get('method') == 'backup_code':
+                    await disconnect_user_live_sessions(user.id)
+        else:
+            step_up_verified = await verify_user_step_up(
+                user,
+                password=form_data.totp_step_up_password,
+                request=request,
+                db=db,
+            )
+
+        if not step_up_verified:
+            log_totp_event(request, 'admin_config_step_up_failed', user.id, logging.WARNING)
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.INVALID_CRED)
+
+    enabled_totp_user_ids = []
+    if totp_config_changed:
+        enabled_totp_user_ids = await UserTOTPs.get_enabled_user_ids(db=db)
+        if not await UserTOTPs.bump_enabled_totp_state_versions(db=db):
+            log_totp_event(request, 'admin_config_state_version_bump_failed', user.id, logging.ERROR)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail='Failed to update TOTP session state.',
+            )
+
     request.app.state.config.SHOW_ADMIN_DETAILS = form_data.SHOW_ADMIN_DETAILS
     request.app.state.config.ADMIN_EMAIL = form_data.ADMIN_EMAIL
     request.app.state.config.WEBUI_URL = form_data.WEBUI_URL
@@ -1382,6 +1968,7 @@ async def update_admin_config(request: Request, form_data: AdminConfig, user=Dep
     request.app.state.config.ENABLE_API_KEYS = form_data.ENABLE_API_KEYS
     request.app.state.config.ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS = form_data.ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS
     request.app.state.config.API_KEYS_ALLOWED_ENDPOINTS = form_data.API_KEYS_ALLOWED_ENDPOINTS
+    request.app.state.config.ENABLE_TOTP = form_data.ENABLE_TOTP
 
     request.app.state.config.ENABLE_FOLDERS = form_data.ENABLE_FOLDERS
     request.app.state.config.FOLDER_MAX_FILE_COUNT = (
@@ -1421,7 +2008,23 @@ async def update_admin_config(request: Request, form_data: AdminConfig, user=Dep
 
     request.app.state.config.RESPONSE_WATERMARK = form_data.RESPONSE_WATERMARK
 
-    return {
+    session_response = None
+    if totp_config_changed and await UserTOTPs.get_user_totp_by_user_id(user.id, db=db):
+        session_response = await create_session_response(
+            request,
+            user,
+            db,
+            response,
+            set_cookie=True,
+            mfa_verified=form_data.ENABLE_TOTP,
+            auth_method=get_request_auth_method(request),
+        )
+
+    if totp_config_changed:
+        for enabled_user_id in enabled_totp_user_ids:
+            asyncio.create_task(disconnect_user_sessions_soon(enabled_user_id))
+
+    config_response = {
         'SHOW_ADMIN_DETAILS': request.app.state.config.SHOW_ADMIN_DETAILS,
         'ADMIN_EMAIL': request.app.state.config.ADMIN_EMAIL,
         'WEBUI_URL': request.app.state.config.WEBUI_URL,
@@ -1429,6 +2032,7 @@ async def update_admin_config(request: Request, form_data: AdminConfig, user=Dep
         'ENABLE_API_KEYS': request.app.state.config.ENABLE_API_KEYS,
         'ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS': request.app.state.config.ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS,
         'API_KEYS_ALLOWED_ENDPOINTS': request.app.state.config.API_KEYS_ALLOWED_ENDPOINTS,
+        'ENABLE_TOTP': request.app.state.config.ENABLE_TOTP,
         'DEFAULT_USER_ROLE': request.app.state.config.DEFAULT_USER_ROLE,
         'DEFAULT_GROUP_ID': request.app.state.config.DEFAULT_GROUP_ID,
         'JWT_EXPIRES_IN': request.app.state.config.JWT_EXPIRES_IN,
@@ -1449,6 +2053,16 @@ async def update_admin_config(request: Request, form_data: AdminConfig, user=Dep
         'PENDING_USER_OVERLAY_CONTENT': request.app.state.config.PENDING_USER_OVERLAY_CONTENT,
         'RESPONSE_WATERMARK': request.app.state.config.RESPONSE_WATERMARK,
     }
+    if session_response:
+        config_response.update(
+            {
+                'token': session_response['token'],
+                'token_type': session_response['token_type'],
+                'expires_at': session_response['expires_at'],
+            }
+        )
+
+    return config_response
 
 
 class LdapServerConfig(BaseModel):
@@ -1603,6 +2217,181 @@ class TokenExchangeForm(BaseModel):
     token: str  # OAuth access token from external provider
 
 
+def _claim_values(value) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, (list, tuple, set)):
+        return {str(item) for item in value if item is not None}
+    return {str(value)}
+
+
+def _split_config_values(value) -> set[str]:
+    value = getattr(value, 'value', value)
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        return {str(item).strip() for item in value if str(item).strip()}
+    return {item for item in re.split(r'[\s,]+', str(value)) if item}
+
+
+def _token_exchange_audiences(client_id: str) -> set[str]:
+    audiences = {client_id}
+    audiences.update(_split_config_values(auth_manager_config.OAUTH_AUDIENCE))
+    return audiences
+
+
+def _token_exchange_client_is_bound(claims: dict, client_id: str) -> bool:
+    client_claims = set()
+    for claim_name in ('azp', 'client_id', 'cid', 'appid'):
+        client_claims.update(_claim_values(claims.get(claim_name)))
+
+    if client_claims:
+        return client_id in client_claims
+
+    return client_id in _claim_values(claims.get('aud'))
+
+
+async def _get_token_exchange_metadata(request: Request, provider: str, client) -> dict:
+    metadata = getattr(client, 'server_metadata', None)
+    if metadata:
+        if hasattr(metadata, 'model_dump'):
+            return metadata.model_dump(exclude_none=True)
+        return dict(metadata)
+
+    metadata_url = request.app.state.oauth_manager.get_server_metadata_url(provider)
+    if not metadata_url:
+        return {}
+
+    async with ClientSession(trust_env=True) as client_session:
+        async with client_session.get(metadata_url, ssl=AIOHTTP_CLIENT_SESSION_SSL) as response:
+            if response.status != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail='Unable to load OAuth provider metadata',
+                )
+            metadata = await response.json()
+            return dict(metadata or {})
+
+
+async def _introspect_token(
+    metadata: dict,
+    client_id: str,
+    client_secret: str | None,
+    token: str,
+) -> dict:
+    introspection_endpoint = metadata.get('introspection_endpoint')
+    if not introspection_endpoint:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='OAuth provider does not support token introspection for opaque token exchange',
+        )
+
+    async def post_introspection(data: dict, auth=None):
+        async with ClientSession(trust_env=True) as client_session:
+            async with client_session.post(
+                introspection_endpoint,
+                data=data,
+                auth=auth,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as response:
+                try:
+                    payload = await response.json(content_type=None)
+                except Exception:
+                    payload = {}
+                return response.status, payload
+
+    data = {'token': token}
+    auth = BasicAuth(client_id, client_secret) if client_secret else None
+    status_code, payload = await post_introspection(data, auth=auth)
+
+    if status_code in {400, 401, 403} and client_secret:
+        data = {
+            'token': token,
+            'client_id': client_id,
+            'client_secret': client_secret,
+        }
+        status_code, payload = await post_introspection(data)
+
+    if status_code != 200 or not isinstance(payload, dict) or not payload.get('active'):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid OAuth access token')
+
+    return payload
+
+
+async def validate_token_exchange_access_token(request: Request, provider: str, client, token: str) -> dict:
+    client_id = getattr(client, 'client_id', None)
+    if not client_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='OAuth client is missing client_id')
+
+    metadata = await _get_token_exchange_metadata(request, provider, client)
+    audiences = _token_exchange_audiences(client_id)
+    token_parts = token.split('.')
+
+    if len(token_parts) == 3:
+        jwks_uri = metadata.get('jwks_uri')
+        if not jwks_uri:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='OAuth provider metadata is missing jwks_uri',
+            )
+
+        algorithms = metadata.get('id_token_signing_alg_values_supported') or [
+            'RS256',
+            'RS384',
+            'RS512',
+            'ES256',
+            'ES384',
+            'ES512',
+            'PS256',
+            'PS384',
+            'PS512',
+        ]
+        decode_kwargs = {
+            'algorithms': algorithms,
+            'audience': sorted(audiences),
+            'options': {'require': ['exp']},
+        }
+        if metadata.get('issuer'):
+            decode_kwargs['issuer'] = metadata['issuer']
+
+        try:
+            jwks_client = pyjwt.PyJWKClient(jwks_uri)
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            claims = pyjwt.decode(token, signing_key.key, **decode_kwargs)
+        except pyjwt.InvalidTokenError as exc:
+            log.warning('Token exchange rejected unverified access token for provider %s: %s', provider, exc)
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Invalid OAuth access token')
+
+        if not _token_exchange_client_is_bound(claims, client_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='OAuth access token is not bound to this client',
+            )
+        return claims
+
+    claims = await _introspect_token(
+        metadata,
+        client_id,
+        getattr(client, 'client_secret', None),
+        token,
+    )
+    token_audiences = _claim_values(claims.get('aud') or claims.get('audience'))
+    if token_audiences and not (token_audiences & audiences):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='OAuth access token has an unexpected audience',
+        )
+    if not _token_exchange_client_is_bound(claims, client_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='OAuth access token is not bound to this client',
+        )
+
+    return claims
+
+
 @router.post('/oauth/{provider}/token/exchange', response_model=SessionUserResponse | TOTPChallengeResponse)
 async def token_exchange(
     request: Request,
@@ -1638,9 +2427,16 @@ async def token_exchange(
             detail=ERROR_MESSAGES.OAUTH_NOT_CONFIGURED(provider),
         )
 
-    # Validate the token by calling the userinfo endpoint
+    # Validate the token is intended for this OAuth client/resource before
+    # trusting userinfo. This prevents exchanging arbitrary provider tokens
+    # issued to another app.
     try:
         token_data = {'access_token': form_data.token, 'token_type': 'Bearer'}
+        token_claims = await validate_token_exchange_access_token(request, provider, client, form_data.token)
+        if token_claims.get('exp') is not None:
+            token_data['expires_at'] = int(token_claims['exp'])
+        if token_claims.get('sid'):
+            token_data['sid'] = str(token_claims['sid'])
         user_data = await client.userinfo(token=token_data)
 
         if not user_data:
@@ -1648,6 +2444,8 @@ async def token_exchange(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail='Invalid token or unable to fetch user info',
             )
+    except HTTPException:
+        raise
     except Exception as e:
         log.warning(f'Token exchange failed for provider {provider}: {e}')
         raise HTTPException(
@@ -1667,6 +2465,8 @@ async def token_exchange(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Token missing required 'sub' claim",
         )
+
+    sid = _extract_oauth_sid(token_data, user_data)
 
     email = user_data.get(email_claim, '')
     if not email:
@@ -1688,15 +2488,23 @@ async def token_exchange(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    # Try to find the user by OAuth sub
-    user = await Users.get_user_by_oauth_sub(provider, sub, db=db)
+    # Try to find the user by OAuth sub. Fail closed on lookup errors so DB
+    # trouble cannot fall through to email merge.
+    try:
+        user = await _get_user_by_oauth_sub_strict(provider, sub, db=db)
+    except Exception:
+        log.warning('Token exchange failed during OAuth-sub lookup for provider %s', provider, exc_info=True)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=ERROR_MESSAGES.DEFAULT())
+    pending_oauth_link = False
 
     if not user and OAUTH_MERGE_ACCOUNTS_BY_EMAIL.value:
         # Try to find by email if merge is enabled
-        user = await Users.get_user_by_email(email, db=db)
-        if user:
-            # Link the OAuth sub to this user
-            await Users.update_user_oauth_by_id(user.id, provider, sub, db=db)
+        try:
+            user = await _get_user_by_email_strict(email, db=db)
+        except Exception:
+            log.warning('Token exchange failed during email lookup for provider %s', provider, exc_info=True)
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=ERROR_MESSAGES.DEFAULT())
+        pending_oauth_link = bool(user)
 
     if not user:
         raise HTTPException(
@@ -1704,4 +2512,60 @@ async def token_exchange(
             detail='User not found. Please sign in via the web interface first.',
         )
 
-    return await create_session_or_totp_challenge_response(request, user, db)
+    if pending_oauth_link:
+        await oauth_manager._validate_oauth_managed_access(user, user_data)
+    else:
+        user = await oauth_manager._revoke_oauth_managed_access(user, user_data, db=db)
+
+    if request.app.state.config.ENABLE_TOTP and await UserTOTPs.is_totp_enabled_by_user_id(user.id, db=db):
+        return await create_totp_challenge_response(
+            user,
+            db,
+            auth_method='oauth_token_exchange',
+            oauth_provider=provider,
+            oauth_subject=sub,
+            oauth_sid=sid,
+            oauth_token=encrypt_totp_data(
+                {
+                    'token_exchange': True,
+                    'token': _json_safe_dict(token_data),
+                    'user_data': _json_safe_dict(user_data),
+                    'email': email,
+                    'sub': sub,
+                    'sid': sid,
+                }
+            ),
+        )
+
+    user = await oauth_manager._sync_oauth_managed_access(request, provider, user, user_data, db=db)
+
+    if pending_oauth_link:
+        if not await Users.update_user_oauth_by_id(user.id, provider, sub, db=db):
+            raise HTTPException(500, detail='Failed to link OAuth account.')
+
+    oauth_token = {**token_data, 'sub': sub, 'sid': sid}
+    oauth_session = await store_oauth_session(
+        user.id,
+        provider,
+        oauth_token,
+        sid=sid,
+        db=db,
+        redis_client=request.app.state.redis,
+    )
+    if not oauth_session:
+        raise HTTPException(500, detail='Failed to store OAuth session.')
+    if sid:
+        try:
+            await record_oauth_sid_user_mapping(request.app.state.redis, provider, sid, user.id, oauth_token)
+        except Exception:
+            log.warning('Token exchange failed to store OAuth sid mapping for provider %s', provider, exc_info=True)
+            raise HTTPException(500, detail='Failed to store OAuth session.')
+    extra_token_data = get_oauth_session_token_claims(provider, oauth_session)
+
+    return await create_session_or_totp_challenge_response(
+        request,
+        user,
+        db,
+        auth_method='oauth_token_exchange',
+        extra_token_data=extra_token_data,
+    )

@@ -415,7 +415,7 @@ export const getTOTPStatus = async (token: string) => {
 	return res;
 };
 
-export const setupTOTP = async (token: string) => {
+export const setupTOTP = async (token: string, password?: string) => {
 	let error = null;
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/totp/setup`, {
@@ -423,7 +423,10 @@ export const setupTOTP = async (token: string) => {
 		headers: {
 			'Content-Type': 'application/json',
 			...(token && { authorization: `Bearer ${token}` })
-		}
+		},
+		body: JSON.stringify({
+			...(password ? { password: password } : {})
+		})
 	})
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();
@@ -442,7 +445,7 @@ export const setupTOTP = async (token: string) => {
 	return res;
 };
 
-export const enableTOTP = async (token: string, code: string) => {
+export const enableTOTP = async (token: string, code: string, password?: string) => {
 	let error = null;
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/totp/enable`, {
@@ -452,6 +455,7 @@ export const enableTOTP = async (token: string, code: string) => {
 			...(token && { authorization: `Bearer ${token}` })
 		},
 		body: JSON.stringify({
+			...(password ? { password: password } : {}),
 			code: code
 		})
 	})

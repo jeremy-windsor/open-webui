@@ -1138,7 +1138,7 @@ async def get_terminal_tools(
     """
     connections = request.app.state.config.TERMINAL_SERVER_CONNECTIONS or []
     connection = next((c for c in connections if c.get('id') == terminal_id), None)
-    if connection is None:
+    if connection is None or not connection.get('enabled', True):
         log.warning(f'Terminal server not found: {terminal_id}')
         return {}
 

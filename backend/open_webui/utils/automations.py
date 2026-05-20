@@ -308,7 +308,7 @@ async def _set_terminal_cwd(app, server_id: str, user, cwd: str, chat_id: str) -
         return
     connections = getattr(connections, 'TERMINAL_SERVER_CONNECTIONS', None) or []
     connection = next((c for c in connections if c.get('id') == server_id), None)
-    if connection is None:
+    if connection is None or not connection.get('enabled', True):
         log.warning(f'Terminal server {server_id} not found for CWD set')
         return
 

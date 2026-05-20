@@ -158,6 +158,9 @@ async def has_connection_access(
     """
     from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
 
+    if connection.get('enabled') is False or (connection.get('config') or {}).get('enable') is False:
+        return False
+
     if user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL:
         return True
 

@@ -14,12 +14,14 @@
 		getUserTOTPStatusById,
 		updateUserById
 	} from '$lib/apis/users';
+	import { getSessionUser } from '$lib/apis/auths';
 
 	import Modal from '$lib/components/common/Modal.svelte';
 	import localizedFormat from 'dayjs/plugin/localizedFormat';
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import SensitiveInput from '$lib/components/common/SensitiveInput.svelte';
 	import UserProfileImage from '$lib/components/chat/Settings/Account/UserProfileImage.svelte';
+	import { config, socket, user as currentUser } from '$lib/stores';
 
 	const i18n: Writable<i18nType> = getContext('i18n');
 	const dispatch = createEventDispatcher();
@@ -37,8 +39,17 @@
 		if (selectedUser) {
 			_user = selectedUser;
 			_user.password = '';
+			_user.current_password = '';
+			totpAdminPassword = '';
+			totpAdminCode = '';
+			totpAdminBackupCode = '';
+			totpAdminUseBackupCode = false;
 			loadUserGroups();
-			loadTOTPStatus();
+			if ($config?.features?.enable_totp) {
+				loadTOTPStatus();
+			} else {
+				totpStatus = null;
+			}
 		}
 	};
 
@@ -47,11 +58,16 @@
 		role: 'pending',
 		name: '',
 		email: '',
-		password: ''
+		password: '',
+		current_password: ''
 	};
 
 	let userGroups: any[] | null = null;
 	let totpStatus: { enabled: boolean; backup_codes_remaining: number } | null = null;
+	let totpAdminPassword = '';
+	let totpAdminCode = '';
+	let totpAdminBackupCode = '';
+	let totpAdminUseBackupCode = false;
 
 	const submitHandler = async () => {
 		const res = await updateUserById(localStorage.token, selectedUser.id, _user).catch((error) => {
@@ -82,16 +98,42 @@
 		});
 	};
 
-	const disableTOTPHandler = async () => {
-		if (!selectedUser?.id) return;
-		if (!confirm($i18n.t('Disable two-factor authentication for this user?'))) return;
+	const refreshSessionAfterTokenChange = async (token?: string) => {
+		if (!token) {
+			return;
+		}
 
-		const res = await disableUserTOTPById(localStorage.token, selectedUser.id).catch((error) => {
+		localStorage.token = token;
+		const sessionUser = await getSessionUser(token).catch((error) => {
 			toast.error(`${error}`);
 			return null;
 		});
 
+		if (sessionUser) {
+			$socket?.emit('user-join', { auth: { token } });
+			await currentUser.set(sessionUser);
+		}
+	};
+
+	const disableTOTPHandler = async () => {
+		if (!selectedUser?.id) return;
+		if (!confirm($i18n.t('Disable two-factor authentication for this user?'))) return;
+
+		const res = await disableUserTOTPById(localStorage.token, selectedUser.id, {
+			...(totpAdminPassword ? { password: totpAdminPassword } : {}),
+			...(totpAdminUseBackupCode ? { backup_code: totpAdminBackupCode } : { code: totpAdminCode })
+		}).catch((error) => {
+			toast.error(`${error}`);
+			return null;
+		});
+		totpAdminPassword = '';
+		totpAdminCode = '';
+		totpAdminBackupCode = '';
+
 		if (res) {
+			if (res.token) {
+				await refreshSessionAfterTokenChange(res.token);
+			}
 			totpStatus = res;
 			toast.success($i18n.t('Two-factor authentication disabled.'));
 		}
@@ -247,7 +289,24 @@
 										</div>
 									</div>
 
-									{#if totpStatus?.enabled}
+									{#if selectedUser?.id === sessionUser?.id && _user.password}
+										<div class="flex flex-col w-full">
+											<div class=" mb-1 text-xs text-gray-500">{$i18n.t('Current Password')}</div>
+
+											<div class="flex-1">
+												<SensitiveInput
+													type="password"
+													aria-label={$i18n.t('Current Password')}
+													placeholder={$i18n.t('Enter Current Password')}
+													bind:value={_user.current_password}
+													autocomplete="current-password"
+													required={false}
+												/>
+											</div>
+										</div>
+									{/if}
+
+									{#if $config?.features?.enable_totp && totpStatus?.enabled}
 										<div class="flex flex-col w-full">
 											<div class="mb-1 text-xs text-gray-500">
 												{$i18n.t('Two-factor authentication')}
@@ -257,7 +316,57 @@
 												<div class="text-xs text-gray-500">
 													{$i18n.t('Backup codes remaining')}: {totpStatus.backup_codes_remaining}
 												</div>
+											</div>
 
+											<SensitiveInput
+												id="admin-totp-disable-password"
+												type="password"
+												placeholder={$i18n.t('Current admin password or recent SSO sign-in')}
+												bind:value={totpAdminPassword}
+												autocomplete="current-password"
+												required={false}
+											/>
+
+											<div class="text-xs text-gray-500">
+												{$i18n.t(
+													'Use your admin account authenticator or backup code if your admin account has two-factor authentication enabled.'
+												)}
+											</div>
+
+											{#if totpAdminUseBackupCode}
+												<input
+													class="w-full text-sm bg-transparent outline-hidden"
+													type="text"
+													autocomplete="one-time-code"
+													placeholder={$i18n.t('Backup code')}
+													bind:value={totpAdminBackupCode}
+												/>
+											{:else}
+												<input
+													class="w-full text-sm bg-transparent outline-hidden"
+													type="text"
+													inputmode="numeric"
+													autocomplete="one-time-code"
+													placeholder={$i18n.t('Authenticator code')}
+													bind:value={totpAdminCode}
+												/>
+											{/if}
+
+											<button
+												class="w-fit text-xs underline text-gray-500"
+												type="button"
+												on:click={() => {
+													totpAdminUseBackupCode = !totpAdminUseBackupCode;
+													totpAdminCode = '';
+													totpAdminBackupCode = '';
+												}}
+											>
+												{totpAdminUseBackupCode
+													? $i18n.t('Use authenticator code')
+													: $i18n.t('Use backup code')}
+											</button>
+
+											<div class="flex justify-end">
 												<button
 													class="text-xs font-medium text-red-500"
 													type="button"

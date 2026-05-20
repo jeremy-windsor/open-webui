@@ -5,6 +5,7 @@
 	import { getBackendConfig, getVersionUpdates, getWebhookUrl, updateWebhookUrl } from '$lib/apis';
 	import {
 		getAdminConfig,
+		getSessionUser,
 		getLdapConfig,
 		getLdapServer,
 		updateAdminConfig,
@@ -17,7 +18,7 @@
 	import Switch from '$lib/components/common/Switch.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import { WEBUI_BUILD_HASH, WEBUI_VERSION } from '$lib/constants';
-	import { banners as _banners, config, showChangelog } from '$lib/stores';
+	import { banners as _banners, config, showChangelog, socket, user } from '$lib/stores';
 	import type { Banner } from '$lib/types';
 	import { compareVersion } from '$lib/utils';
 	import { onMount, getContext } from 'svelte';
@@ -36,6 +37,11 @@
 	};
 
 	let adminConfig = null;
+	let initialEnableTOTP: boolean | null = null;
+	let totpConfigPassword = '';
+	let totpConfigCode = '';
+	let totpConfigBackupCode = '';
+	let totpConfigUseBackupCode = false;
 	let webhookUrl = '';
 	let groups = [];
 
@@ -88,9 +94,45 @@
 		_banners.set(await setBanners(localStorage.token, banners));
 	};
 
+	const refreshSessionAfterTokenChange = async (token?: string) => {
+		if (!token) {
+			return;
+		}
+
+		localStorage.token = token;
+		const sessionUser = await getSessionUser(token).catch((error) => {
+			toast.error(`${error}`);
+			return null;
+		});
+
+		if (sessionUser) {
+			$socket?.emit('user-join', { auth: { token } });
+			await user.set(sessionUser);
+		}
+	};
+
 	const updateHandler = async () => {
 		webhookUrl = await updateWebhookUrl(localStorage.token, webhookUrl);
-		const res = await updateAdminConfig(localStorage.token, adminConfig);
+		const adminConfigPayload = { ...adminConfig };
+		if (initialEnableTOTP !== null && adminConfig.ENABLE_TOTP !== initialEnableTOTP) {
+			Object.assign(adminConfigPayload, {
+				...(totpConfigPassword ? { totp_step_up_password: totpConfigPassword } : {}),
+				...(totpConfigUseBackupCode
+					? { totp_step_up_backup_code: totpConfigBackupCode }
+					: { totp_step_up_code: totpConfigCode })
+			});
+		}
+
+		const res = await updateAdminConfig(localStorage.token, adminConfigPayload);
+		if (!res) {
+			toast.error($i18n.t('Failed to update settings'));
+			return;
+		}
+
+		if (res.token) {
+			await refreshSessionAfterTokenChange(res.token);
+		}
+
 		await updateLdapConfig(localStorage.token, ENABLE_LDAP);
 		await updateLdapServerHandler();
 
@@ -98,11 +140,11 @@
 
 		await config.set(await getBackendConfig());
 
-		if (res) {
-			saveHandler();
-		} else {
-			toast.error($i18n.t('Failed to update settings'));
-		}
+		initialEnableTOTP = adminConfig.ENABLE_TOTP;
+		totpConfigPassword = '';
+		totpConfigCode = '';
+		totpConfigBackupCode = '';
+		saveHandler();
 	};
 
 	onMount(async () => {
@@ -113,6 +155,7 @@
 		await Promise.all([
 			(async () => {
 				adminConfig = await getAdminConfig(localStorage.token);
+				initialEnableTOTP = adminConfig?.ENABLE_TOTP ?? null;
 			})(),
 
 			(async () => {
@@ -430,6 +473,58 @@
 								</div>
 							</div>
 						{/if}
+					{/if}
+
+					<div class="mb-2.5 flex w-full justify-between pr-2">
+						<div class=" self-center text-xs font-medium">{$i18n.t('Enable TOTP')}</div>
+
+						<Switch bind:state={adminConfig.ENABLE_TOTP} />
+					</div>
+
+					{#if initialEnableTOTP !== null && adminConfig.ENABLE_TOTP !== initialEnableTOTP}
+						<div class="mb-2.5 flex w-full flex-col gap-2 pr-2">
+							<SensitiveInput
+								id="totp-config-password"
+								type="password"
+								placeholder={$i18n.t('Admin password or recent SSO sign-in')}
+								bind:value={totpConfigPassword}
+								autocomplete="current-password"
+								required={false}
+							/>
+
+							{#if totpConfigUseBackupCode}
+								<input
+									class="w-full text-sm dark:text-gray-300 bg-transparent outline-hidden"
+									type="text"
+									autocomplete="one-time-code"
+									placeholder={$i18n.t('Backup code')}
+									bind:value={totpConfigBackupCode}
+								/>
+							{:else}
+								<input
+									class="w-full text-sm dark:text-gray-300 bg-transparent outline-hidden"
+									type="text"
+									inputmode="numeric"
+									autocomplete="one-time-code"
+									placeholder={$i18n.t('Authenticator code')}
+									bind:value={totpConfigCode}
+								/>
+							{/if}
+
+							<button
+								class="w-fit text-xs underline text-gray-500"
+								type="button"
+								on:click={() => {
+									totpConfigUseBackupCode = !totpConfigUseBackupCode;
+									totpConfigCode = '';
+									totpConfigBackupCode = '';
+								}}
+							>
+								{totpConfigUseBackupCode
+									? $i18n.t('Use authenticator code')
+									: $i18n.t('Use backup code')}
+							</button>
+						</div>
 					{/if}
 
 					<div class=" mb-2.5 w-full justify-between">

@@ -10,6 +10,7 @@ from mcp.shared.auth import OAuthMetadata
 from open_webui.config import BannerModel, async_save_config, get_config, save_config
 from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL, AIOHTTP_CLIENT_TIMEOUT
 from open_webui.models.oauth_sessions import OAuthSessions
+from open_webui.routers.terminals import disconnect_all_terminal_sessions
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import get_custom_headers
 from open_webui.utils.mcp.client import MCPClient
@@ -265,6 +266,7 @@ async def set_terminal_servers_config(
     ]
 
     await set_terminal_servers(request)
+    await disconnect_all_terminal_sessions()
 
     return {
         'TERMINAL_SERVER_CONNECTIONS': request.app.state.config.TERMINAL_SERVER_CONNECTIONS,

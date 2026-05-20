@@ -44,5 +44,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index('idx_user_totp_enabled', table_name='user_totp')
+    existing_tables = set(get_existing_tables())
+    if 'user_totp' not in existing_tables:
+        return
+
+    inspector = sa.inspect(op.get_bind())
+    existing_indexes = {index['name'] for index in inspector.get_indexes('user_totp')}
+    if 'idx_user_totp_enabled' in existing_indexes:
+        op.drop_index('idx_user_totp_enabled', table_name='user_totp')
     op.drop_table('user_totp')

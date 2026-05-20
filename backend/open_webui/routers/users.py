@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import datetime
 import io
 import logging
 import time
@@ -9,7 +11,13 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from open_webui.constants import ERROR_MESSAGES
-from open_webui.env import ENABLE_PROFILE_IMAGE_URL_FORWARDING, PROFILE_IMAGE_ALLOWED_MIME_TYPES, STATIC_DIR
+from open_webui.env import (
+    ENABLE_PROFILE_IMAGE_URL_FORWARDING,
+    PROFILE_IMAGE_ALLOWED_MIME_TYPES,
+    STATIC_DIR,
+    WEBUI_AUTH_COOKIE_SAME_SITE,
+    WEBUI_AUTH_COOKIE_SECURE,
+)
 from open_webui.internal.db import get_async_session
 from open_webui.models.auths import Auths
 from open_webui.models.groups import Groups
@@ -31,20 +39,60 @@ from open_webui.models.knowledge import Knowledges
 from open_webui.models.models import Models
 from open_webui.models.tools import Tools
 from open_webui.models.totp import UserTOTPs
-from open_webui.socket.main import disconnect_user_sessions
 from open_webui.utils.access_control import get_permissions, has_permission
 from open_webui.utils.auth import (
+    create_token,
+    decode_token,
     get_admin_user,
+    get_http_authorization_cred,
     get_password_hash,
+    get_request_oauth_token_binding_claims,
     get_verified_user,
     validate_password,
 )
-from pydantic import BaseModel, ConfigDict
+from open_webui.utils.auth_state import update_password_and_revoke_auth_state
+from open_webui.utils.misc import parse_duration
+from open_webui.utils.rate_limit import RateLimiter
+from open_webui.utils.redis import get_redis_client
+from open_webui.utils.sessions import disconnect_user_live_sessions
+from open_webui.utils.totp_auth import (
+    consume_totp_verification,
+    request_uses_api_key_auth,
+    validate_totp_or_backup_code,
+    verify_password_step_up,
+    verify_user_step_up,
+)
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+totp_admin_rate_limiter = RateLimiter(redis_client=get_redis_client(), limit=5, window=60 * 5)
+
+
+async def disconnect_user_sessions_soon(user_id: str, delay_seconds: float = 1.0) -> None:
+    await asyncio.sleep(delay_seconds)
+    await disconnect_user_live_sessions(user_id)
+
+
+def get_request_auth_method(request: Request) -> str:
+    token = None
+    auth_header = request.headers.get('Authorization')
+    if auth_header:
+        auth_cred = get_http_authorization_cred(auth_header)
+        if auth_cred is not None:
+            token = auth_cred.credentials
+    if token is None:
+        token = request.cookies.get('token')
+    if token is None and getattr(request.state, 'token', None):
+        token = request.state.token.credentials
+
+    data = decode_token(token) if token else None
+    if data and data.get('auth_method'):
+        return data['auth_method']
+
+    return 'password'
 
 
 ############################
@@ -421,6 +469,65 @@ class UserTOTPAdminStatusResponse(BaseModel):
     created_at: int | None = None
     last_used_at: int | None = None
     backup_codes_remaining: int = 0
+    token: str | None = None
+    token_type: str | None = None
+    expires_at: int | None = None
+
+
+class UserTOTPAdminDisableForm(BaseModel):
+    password: str | None = Field(default=None, max_length=1024)
+    code: str | None = Field(default=None, max_length=32)
+    backup_code: str | None = Field(default=None, max_length=64)
+
+
+async def create_totp_admin_session_payload(
+    request: Request,
+    response: Response,
+    user: UserModel,
+    db: AsyncSession,
+) -> dict:
+    if not request.app.state.config.ENABLE_TOTP:
+        return {}
+
+    user_totp = await UserTOTPs.get_user_totp_by_user_id(user.id, db=db)
+    if not user_totp or not user_totp.enabled:
+        return {}
+
+    expires_delta = parse_duration(request.app.state.config.JWT_EXPIRES_IN)
+    expires_at = None
+    if expires_delta:
+        expires_at = int(time.time()) + int(expires_delta.total_seconds())
+
+    auth_method = get_request_auth_method(request)
+    token_data = {
+        'id': user.id,
+        'auth_method': auth_method,
+        'auth_state_version': user.auth_state_version or 0,
+        'totp_state_version': user_totp.backup_code_version or 0,
+        'mfa': {
+            'totp': True,
+            'totp_version': user_totp.backup_code_version or 0,
+            'verified_at': int(time.time()),
+        },
+    }
+    if auth_method in {'oauth', 'oauth_token_exchange'}:
+        token_data.update(get_request_oauth_token_binding_claims(request))
+
+    token = create_token(
+        data=token_data,
+        expires_delta=expires_delta,
+    )
+
+    response.set_cookie(
+        key='token',
+        value=token,
+        expires=datetime.datetime.fromtimestamp(expires_at, datetime.timezone.utc) if expires_at else None,
+        httponly=True,
+        samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
+        secure=WEBUI_AUTH_COOKIE_SECURE,
+        **({'max_age': int(expires_delta.total_seconds())} if expires_delta else {}),
+    )
+    return {'token': token, 'token_type': 'Bearer', 'expires_at': expires_at}
 
 
 @router.get('/{user_id}', response_model=UserActiveResponse)
@@ -466,8 +573,17 @@ async def get_user_info_by_id(
 
 @router.get('/{user_id}/totp', response_model=UserTOTPAdminStatusResponse)
 async def get_user_totp_status_by_id(
-    user_id: str, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
+    user_id: str,
+    request: Request,
+    user=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_async_session),
 ):
+    if not request.app.state.config.ENABLE_TOTP:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+
+    if request_uses_api_key_auth(request):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+
     target_user = await Users.get_user_by_id(user_id, db=db)
     if not target_user:
         raise HTTPException(
@@ -489,8 +605,19 @@ async def get_user_totp_status_by_id(
 
 @router.delete('/{user_id}/totp', response_model=UserTOTPAdminStatusResponse)
 async def disable_user_totp_by_id(
-    user_id: str, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
+    user_id: str,
+    request: Request,
+    response: Response,
+    form_data: UserTOTPAdminDisableForm,
+    user=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_async_session),
 ):
+    if not request.app.state.config.ENABLE_TOTP:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+
+    if request_uses_api_key_auth(request):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+
     target_user = await Users.get_user_by_id(user_id, db=db)
     if not target_user:
         raise HTTPException(
@@ -498,13 +625,74 @@ async def disable_user_totp_by_id(
             detail=ERROR_MESSAGES.USER_NOT_FOUND,
         )
 
+    primary_admin = await Users.get_first_user(db=db)
+    if not primary_admin or user.id != primary_admin.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+    if user_id == primary_admin.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACTION_PROHIBITED)
+
+    source_ip = request.client.host if request.client else 'unknown'
+    if totp_admin_rate_limiter.is_limited(f'admin-reset:{user.id}:{source_ip}'):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=ERROR_MESSAGES.RATE_LIMIT_EXCEEDED,
+        )
+
+    step_up_verified = False
+    if await UserTOTPs.is_totp_enabled_by_user_id(user.id, db=db):
+        verification = await validate_totp_or_backup_code(
+            user.id,
+            code=form_data.code,
+            backup_code=form_data.backup_code,
+            db=db,
+        )
+        if verification and await consume_totp_verification(user.id, verification, db=db):
+            step_up_verified = True
+            if verification.get('method') == 'backup_code':
+                await disconnect_user_live_sessions(user.id)
+    else:
+        step_up_verified = await verify_user_step_up(
+            user,
+            password=form_data.password,
+            request=request,
+            db=db,
+        )
+
+    if not step_up_verified:
+        log.warning(
+            'TOTP security event: %s',
+            {
+                'event': 'admin_disable_step_up_failed',
+                'admin_user_id': user.id,
+                'target_user_id': user_id,
+                'source_ip': request.client.host if request.client else None,
+            },
+        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.INVALID_CRED)
+
     if not await UserTOTPs.disable_totp_by_user_id(user_id, db=db):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=ERROR_MESSAGES.DEFAULT(),
         )
 
-    return UserTOTPAdminStatusResponse(enabled=False)
+    log.info(
+        'TOTP security event: %s',
+        {
+            'event': 'admin_disabled',
+            'admin_user_id': user.id,
+            'target_user_id': user_id,
+            'source_ip': request.client.host if request.client else None,
+        },
+    )
+
+    asyncio.create_task(disconnect_user_sessions_soon(user_id))
+    asyncio.create_task(disconnect_user_sessions_soon(user.id))
+
+    return UserTOTPAdminStatusResponse(
+        enabled=False,
+        **await create_totp_admin_session_payload(request, response, user, db),
+    )
 
 
 @router.get('/{user_id}/oauth/sessions')
@@ -589,7 +777,9 @@ async def get_user_active_status_by_id(
 
 @router.post('/{user_id}/update', response_model=UserModel | None)
 async def update_user_by_id(
-    user_id: str, form_data: UserUpdateForm,
+    request: Request,
+    user_id: str,
+    form_data: UserUpdateForm,
     session_user: UserModel = Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
@@ -633,13 +823,22 @@ async def update_user_by_id(
                 )
 
         if form_data.password:
+            if session_user.id == user_id and not await verify_password_step_up(
+                session_user,
+                form_data.current_password,
+                db=db,
+            ):
+                raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.INVALID_CRED)
+
             try:
                 validate_password(form_data.password)
             except Exception as e:
                 raise HTTPException(400, detail=str(e))
 
             hashed = get_password_hash(form_data.password)
-            await Auths.update_user_password_by_id(user_id, hashed, db=db)
+            updated_password = await update_password_and_revoke_auth_state(request, user_id, hashed, db=db)
+            if not updated_password:
+                raise HTTPException(500, detail='Failed to update password.')
 
         # Build update dict from only the provided fields
         update_data = {}
@@ -666,7 +865,7 @@ async def update_user_by_id(
             # If the role changed, disconnect all socket sessions so stale
             # privileges cached in SESSION_POOL are invalidated.
             if updated_user.role != user.role:
-                await disconnect_user_sessions(user_id)
+                await disconnect_user_live_sessions(user_id)
             return updated_user
 
         raise HTTPException(
@@ -708,7 +907,7 @@ async def delete_user_by_id(user_id: str, user=Depends(get_admin_user), db: Asyn
         result = await Auths.delete_auth_by_id(user_id, db=db)
 
         if result:
-            await disconnect_user_sessions(user_id)
+            await disconnect_user_live_sessions(user_id)
             return True
 
         raise HTTPException(

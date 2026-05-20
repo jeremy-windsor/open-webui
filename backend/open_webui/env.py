@@ -607,6 +607,7 @@ WEBUI_SECRET_KEY = os.getenv(
     'WEBUI_SECRET_KEY',
     os.getenv('WEBUI_JWT_SECRET_KEY', 't0p-s3cr3t'),
 )
+TOTP_SECRET_KEY = (os.getenv('TOTP_SECRET_KEY') or '').strip() or WEBUI_SECRET_KEY
 
 WEBUI_SESSION_COOKIE_SAME_SITE = os.getenv('WEBUI_SESSION_COOKIE_SAME_SITE', 'lax')
 WEBUI_SESSION_COOKIE_SECURE = os.getenv('WEBUI_SESSION_COOKIE_SECURE', 'false').lower() == 'true'

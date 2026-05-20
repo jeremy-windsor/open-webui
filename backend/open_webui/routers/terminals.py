@@ -26,6 +26,75 @@ router = APIRouter()
 
 STREAMING_CONTENT_TYPES = ('application/octet-stream', 'image/', 'application/pdf')
 STRIPPED_RESPONSE_HEADERS = frozenset(('transfer-encoding', 'connection', 'content-encoding', 'content-length'))
+TERMINAL_SESSION_POOL: dict[str, set[WebSocket]] = {}
+TERMINAL_SESSION_TOKENS: dict[WebSocket, dict] = {}
+
+
+async def disconnect_terminal_sessions(user_id: str) -> None:
+    sessions = list(TERMINAL_SESSION_POOL.get(user_id, set()))
+    for session in sessions:
+        try:
+            await session.close(code=4001, reason='Session invalidated')
+        except Exception:
+            pass
+
+    if sessions:
+        TERMINAL_SESSION_POOL.pop(user_id, None)
+        log.info('Disconnected %s terminal session(s) for user %s', len(sessions), user_id)
+
+
+async def disconnect_all_terminal_sessions() -> None:
+    user_ids = list(TERMINAL_SESSION_POOL.keys())
+    for user_id in user_ids:
+        await disconnect_terminal_sessions(user_id)
+
+
+def _token_matches_oauth_session(
+    token_data: dict | None,
+    provider: str,
+    sid: str | None = None,
+    session_ids: set[str] | None = None,
+) -> bool:
+    if not isinstance(token_data, dict):
+        return False
+    if token_data.get('oauth_provider') != provider:
+        return False
+    if sid and token_data.get('oauth_sid') != sid:
+        return False
+    if session_ids and token_data.get('oauth_session_id') not in session_ids:
+        return False
+    return True
+
+
+async def disconnect_terminal_oauth_sessions(
+    user_id: str,
+    provider: str,
+    sid: str | None = None,
+    session_ids: set[str] | None = None,
+) -> None:
+    sessions = list(TERMINAL_SESSION_POOL.get(user_id, set()))
+    disconnected = 0
+    for session in sessions:
+        if not _token_matches_oauth_session(
+            TERMINAL_SESSION_TOKENS.get(session),
+            provider,
+            sid=sid,
+            session_ids=session_ids,
+        ):
+            continue
+        try:
+            await session.close(code=4001, reason='Session invalidated')
+            disconnected += 1
+        except Exception:
+            pass
+
+    if disconnected:
+        log.info(
+            'Disconnected %s OAuth-bound terminal session(s) for user %s provider %s',
+            disconnected,
+            user_id,
+            provider,
+        )
 
 
 def _sanitize_proxy_path(path: str) -> str | None:
@@ -80,7 +149,7 @@ async def proxy_terminal(
     connections = request.app.state.config.TERMINAL_SERVER_CONNECTIONS or []
     connection = next((c for c in connections if c.get('id') == server_id), None)
 
-    if connection is None:
+    if connection is None or not connection.get('enabled', True):
         return JSONResponse({'error': f"Terminal server '{server_id}' not found"}, status_code=404)
 
     user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user.id)}
@@ -193,13 +262,19 @@ async def _resolve_authenticated_connection(ws: WebSocket, server_id: str):
     The client must send ``{"type": "auth", "token": "<jwt>"}`` as its first
     message after connecting.
 
-    Returns ``(user, connection)`` on success, or ``None`` after closing *ws*
+    Returns ``(user, connection, token_data)`` on success, or ``None`` after closing *ws*
     with an appropriate error code.
     """
     import asyncio
     import json
 
-    from open_webui.utils.auth import decode_token
+    from open_webui.utils.auth import (
+        decode_token,
+        is_valid_token,
+        is_verified_user_role,
+        token_meets_mfa_requirements,
+        token_meets_trusted_header_requirements,
+    )
 
     # First-message authentication
     try:
@@ -213,9 +288,21 @@ async def _resolve_authenticated_connection(ws: WebSocket, server_id: str):
         if data is None or 'id' not in data:
             await ws.close(code=4001, reason='Invalid token')
             return None
+        if not await is_valid_token(ws, data):
+            await ws.close(code=4001, reason='Invalid token')
+            return None
         user = await Users.get_user_by_id(data['id'])
         if user is None:
             await ws.close(code=4001, reason='User not found')
+            return None
+        if not is_verified_user_role(user):
+            await ws.close(code=4001, reason='Access denied')
+            return None
+        if not token_meets_trusted_header_requirements(data, user, ws.headers):
+            await ws.close(code=4001, reason='Invalid token')
+            return None
+        if not await token_meets_mfa_requirements(data, user, ws.app.state.config.ENABLE_TOTP):
+            await ws.close(code=4001, reason='Invalid token')
             return None
     except (asyncio.TimeoutError, json.JSONDecodeError):
         await ws.close(code=4001, reason='Auth timeout or invalid payload')
@@ -228,7 +315,7 @@ async def _resolve_authenticated_connection(ws: WebSocket, server_id: str):
     connections = ws.app.state.config.TERMINAL_SERVER_CONNECTIONS or []
     connection = next((c for c in connections if c.get('id') == server_id), None)
 
-    if connection is None:
+    if connection is None or not connection.get('enabled', True):
         await ws.close(code=4004, reason='Terminal server not found')
         return None
 
@@ -237,7 +324,7 @@ async def _resolve_authenticated_connection(ws: WebSocket, server_id: str):
         await ws.close(code=4003, reason='Access denied')
         return None
 
-    return user, connection
+    return user, connection, data
 
 
 @router.websocket('/{server_id}/api/terminals/{session_id}')
@@ -257,7 +344,7 @@ async def ws_terminal(
     result = await _resolve_authenticated_connection(ws, server_id)
     if result is None:
         return
-    user, connection = result
+    user, connection, token_data = result
 
     base_url = (connection.get('url') or '').rstrip('/')
     if not base_url:
@@ -282,6 +369,8 @@ async def ws_terminal(
     if upstream_params:
         upstream_url += f'?{urllib.parse.urlencode(upstream_params)}'
 
+    TERMINAL_SESSION_POOL.setdefault(user.id, set()).add(ws)
+    TERMINAL_SESSION_TOKENS[ws] = token_data
     session = aiohttp.ClientSession()
     try:
         async with session.ws_connect(upstream_url, ssl=AIOHTTP_CLIENT_SESSION_SSL) as upstream:
@@ -293,6 +382,64 @@ async def ws_terminal(
             if auth_type == 'bearer':
                 key = connection.get('key', '')
                 await upstream.send_str(_json.dumps({'type': 'auth', 'token': key}))
+
+            async def _auth_state_watcher():
+                from open_webui.utils.auth import (
+                    is_valid_decoded_token,
+                    is_verified_user_role,
+                    token_meets_mfa_requirements,
+                    token_meets_trusted_header_requirements,
+                )
+
+                while True:
+                    await asyncio.sleep(15)
+                    try:
+                        redis_client = getattr(getattr(ws.app, 'state', None), 'redis', None)
+                        if not await is_valid_decoded_token(token_data, redis_client):
+                            await upstream.close()
+                            await ws.close(code=4001, reason='Session invalidated')
+                            return
+
+                        current_user = await Users.get_user_by_id(user.id)
+                        if (
+                            not current_user
+                            or not is_verified_user_role(current_user)
+                            or not token_meets_trusted_header_requirements(token_data, current_user, ws.headers)
+                            or not await token_meets_mfa_requirements(
+                                token_data,
+                                current_user,
+                                ws.app.state.config.ENABLE_TOTP,
+                            )
+                        ):
+                            await upstream.close()
+                            await ws.close(code=4001, reason='Session invalidated')
+                            return
+
+                        current_connections = ws.app.state.config.TERMINAL_SERVER_CONNECTIONS or []
+                        current_connection = next(
+                            (c for c in current_connections if c.get('id') == server_id),
+                            None,
+                        )
+                        current_user_group_ids = {
+                            group.id for group in await Groups.get_groups_by_member_id(current_user.id)
+                        }
+                        if (
+                            not current_connection
+                            or not current_connection.get('enabled', True)
+                            or not await has_connection_access(
+                                current_user,
+                                current_connection,
+                                current_user_group_ids,
+                            )
+                        ):
+                            await upstream.close()
+                            await ws.close(code=4003, reason='Access denied')
+                            return
+                    except Exception:
+                        log.exception('Failed to revalidate terminal WebSocket session')
+                        await upstream.close()
+                        await ws.close(code=4001, reason='Session invalidated')
+                        return
 
             async def _client_to_upstream():
                 """Forward client → upstream."""
@@ -324,14 +471,25 @@ async def ws_terminal(
                 except Exception:
                     pass
 
-            await asyncio.gather(
-                _client_to_upstream(),
-                _upstream_to_client(),
-                return_exceptions=True,
-            )
+            tasks = [
+                asyncio.create_task(_client_to_upstream()),
+                asyncio.create_task(_upstream_to_client()),
+                asyncio.create_task(_auth_state_watcher()),
+            ]
+            _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
         log.exception('Terminal WebSocket proxy error: %s', e)
     finally:
+        sessions = TERMINAL_SESSION_POOL.get(user.id)
+        if sessions is not None:
+            sessions.discard(ws)
+            if not sessions:
+                TERMINAL_SESSION_POOL.pop(user.id, None)
+        TERMINAL_SESSION_TOKENS.pop(ws, None)
+
         await session.close()
         try:
             await ws.close()

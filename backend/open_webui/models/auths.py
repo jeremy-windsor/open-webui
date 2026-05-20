@@ -104,9 +104,11 @@ class AuthsTable:
         role: str = 'pending',
         oauth: dict | None = None,
         db: AsyncSession | None = None,
+        commit: bool = True,
     ) -> UserModel | None:
         """Create an Auth + User pair inside a single transaction."""
-        async with get_async_db_context(db) as session:
+
+        async def _insert(session: AsyncSession) -> UserModel | None:
             log.info('insert_new_auth')
 
             new_id = str(uuid.uuid4())
@@ -120,12 +122,28 @@ class AuthsTable:
             session.add(credential)
 
             created_user = await Users.insert_new_user(
-                new_id, name, email, profile_image_url, role, oauth=oauth, db=session,
+                new_id,
+                name,
+                email,
+                profile_image_url,
+                role,
+                oauth=oauth,
+                db=session,
+                commit=False,
             )
-            # persist both records and reload generated defaults
-            await session.commit()
-            await session.refresh(credential)
+
+            await session.flush()
+            if commit:
+                await session.commit()
+                await session.refresh(credential)
+
             return created_user if credential and created_user else None
+
+        if db is not None:
+            return await _insert(db)
+
+        async with get_async_db_context(db) as session:
+            return await _insert(session)
 
     async def authenticate_user(
         self, email: str, verify_password: callable, db: AsyncSession | None = None,

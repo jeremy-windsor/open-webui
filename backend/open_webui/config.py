@@ -3415,6 +3415,12 @@ API_KEYS_ALLOWED_ENDPOINTS = ConfigVar(
     os.getenv('API_KEYS_ALLOWED_ENDPOINTS', os.getenv('API_KEY_ALLOWED_ENDPOINTS', '')),
 )
 
+ENABLE_TOTP = ConfigVar(
+    'ENABLE_TOTP',
+    'auth.totp.enable',
+    os.getenv('ENABLE_TOTP', 'False').lower() == 'true',
+)
+
 JWT_EXPIRES_IN = ConfigVar('JWT_EXPIRES_IN', 'auth.jwt_expiry', os.getenv('JWT_EXPIRES_IN', '4w'))
 
 if JWT_EXPIRES_IN.value == '-1':

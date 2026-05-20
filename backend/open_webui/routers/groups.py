@@ -21,6 +21,7 @@ from open_webui.models.models import Models
 from open_webui.models.tools import Tools
 from open_webui.models.users import UserInfoResponse, Users
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.sessions import disconnect_users_live_sessions
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
@@ -174,8 +175,10 @@ async def update_group_by_id(
     db: AsyncSession = Depends(get_async_session),
 ):
     try:
+        affected_user_ids = await Groups.get_group_user_ids_by_id(id, db=db)
         group = await Groups.update_group_by_id(id, form_data, db=db)
         if group:
+            await disconnect_users_live_sessions(affected_user_ids)
             return GroupResponse(
                 **group.model_dump(),
                 member_count=await Groups.get_group_member_count_by_id(group.id, db=db),
@@ -211,6 +214,7 @@ async def add_user_to_group(
 
         group = await Groups.add_users_to_group(id, form_data.user_ids, db=db)
         if group:
+            await disconnect_users_live_sessions(form_data.user_ids)
             return GroupResponse(
                 **group.model_dump(),
                 member_count=await Groups.get_group_member_count_by_id(group.id, db=db),
@@ -238,6 +242,7 @@ async def remove_users_from_group(
     try:
         group = await Groups.remove_users_from_group(id, form_data.user_ids, db=db)
         if group:
+            await disconnect_users_live_sessions(form_data.user_ids)
             return GroupResponse(
                 **group.model_dump(),
                 member_count=await Groups.get_group_member_count_by_id(group.id, db=db),
@@ -263,8 +268,10 @@ async def remove_users_from_group(
 @router.delete('/id/{id}/delete', response_model=bool)
 async def delete_group_by_id(id: str, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
     try:
+        affected_user_ids = await Groups.get_group_user_ids_by_id(id, db=db)
         result = await Groups.delete_group_by_id(id, db=db)
         if result:
+            await disconnect_users_live_sessions(affected_user_ids)
             return result
         else:
             raise HTTPException(
@@ -361,4 +368,3 @@ async def preview_group_access(
         },
         'permissions': group.permissions or {},
     }
-

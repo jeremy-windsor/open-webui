@@ -74,6 +74,7 @@ class User(Base):  # identity & profile
     scim = Column(JSON, nullable=True)
 
     # Timestamps (epoch seconds)
+    auth_state_version = Column(BigInteger, nullable=False, default=0)
     last_active_at = Column(BigInteger)
     updated_at = Column(BigInteger)
     created_at = Column(BigInteger)
@@ -110,6 +111,7 @@ class UserModel(BaseModel):
     oauth: dict | None = None
     scim: dict | None = None
 
+    auth_state_version: int = 0
     last_active_at: int  # timestamp in epoch
     updated_at: int  # timestamp in epoch
     created_at: int  # timestamp in epoch
@@ -262,6 +264,7 @@ class UserUpdateForm(BaseModel):
     email: str | None = None
     profile_image_url: str | None = None
     password: str | None = None
+    current_password: str | None = None
 
     @field_validator('profile_image_url', mode='before')
     @classmethod
@@ -282,8 +285,9 @@ class UsersTable:
         username: str | None = None,
         oauth: dict | None = None,
         db: AsyncSession | None = None,
+        commit: bool = True,
     ) -> UserModel | None:
-        async with get_async_db_context(db) as session:
+        async def _insert(session: AsyncSession) -> UserModel | None:
             user = UserModel(
                 **{
                     'id': id,
@@ -300,9 +304,21 @@ class UsersTable:
             )
             result = User(**user.model_dump())
             session.add(result)
-            await session.commit()
-            await session.refresh(result)
-            return user if result else None
+            await session.flush()
+            if commit:
+                await session.commit()
+                await session.refresh(result)
+            if result:
+                return UserModel.model_validate(result)
+            else:
+                return None
+
+        if db is not None:
+            return await _insert(db)
+
+        async with get_async_db_context(db) as session:
+            return await _insert(session)
+
     # database read methods
     # --- read / lookup operations ---
     async def get_user_by_id(
@@ -533,6 +549,10 @@ class UsersTable:
             return [UserModel.model_validate(user) for user in users]
     # count registered accounts
     async def get_num_users(self, db: AsyncSession | None = None) -> int | None:
+        if db is not None:
+            result = await db.execute(select(func.count()).select_from(User))
+            return result.scalar()
+
         async with get_async_db_context(db) as session:
             result = await session.execute(select(func.count()).select_from(User))
             return result.scalar()
@@ -565,15 +585,34 @@ class UsersTable:
             )
             return result.scalar()
 
-    async def update_user_role_by_id(self, id: str, role: str, db: AsyncSession | None = None) -> UserModel | None:
-        async with get_async_db_context(db) as session:
-            user = await session.get(User, id)
-            if not user:
-                return None
-            user.role = role
-            await session.commit()
-            await session.refresh(user)
-            return UserModel.model_validate(user)
+    async def update_user_role_by_id(
+        self,
+        id: str,
+        role: str,
+        db: AsyncSession | None = None,
+        commit: bool = True,
+    ) -> UserModel | None:
+        try:
+            async def _update(session: AsyncSession) -> UserModel | None:
+                result = await session.execute(select(User).filter_by(id=id))
+                user = result.scalars().first()
+                if not user:
+                    return None
+                user.role = role
+                if commit:
+                    await session.commit()
+                    await session.refresh(user)
+                else:
+                    await session.flush()
+                return UserModel.model_validate(user)
+
+            if db is not None:
+                return await _update(db)
+
+            async with get_async_db_context(db) as db:
+                return await _update(db)
+        except Exception:
+            return None
 
     async def update_user_status_by_id(
         self, id: str, form_data: UserStatus, db: AsyncSession | None = None
@@ -650,6 +689,23 @@ class UsersTable:
             await session.commit()
             await session.refresh(user)
             return UserModel.model_validate(user)
+
+    async def bump_auth_state_version_by_id(self, id: str, db: AsyncSession | None = None) -> bool:
+        try:
+            async with get_async_db_context(db) as db:
+                result = await db.execute(
+                    update(User)
+                    .filter_by(id=id)
+                    .values(
+                        auth_state_version=User.auth_state_version + 1,
+                        updated_at=int(time.time()),
+                    )
+                )
+                await db.commit()
+                return (result.rowcount or 0) == 1
+        except Exception:
+            return False
+
     # settings update helper
     async def update_user_settings_by_id(
         self, id: str, updated: dict, db: AsyncSession | None = None
@@ -745,4 +801,3 @@ class UsersTable:
 
 
 Users = UsersTable()  # singleton user repository
-
